@@ -237,7 +237,7 @@ Si un campo numérico no aplica usa 0. No incluyas texto fuera del JSON."""
 
     response = claude.messages.create(
         model="claude-opus-4-5",
-        max_tokens=4000,
+        max_tokens=8000,
         messages=[{
             "role": "user",
             "content": [
@@ -259,11 +259,25 @@ Si un campo numérico no aplica usa 0. No incluyas texto fuera del JSON."""
 
     texto = response.content[0].text.strip()
     if "```" in texto:
-        texto = texto.split("```")[1]
-        if texto.startswith("json"):
-            texto = texto[4:]
+        partes = texto.split("```")
+        for parte in partes:
+            if parte.startswith("json"):
+                texto = parte[4:]
+                break
+            elif "{" in parte:
+                texto = parte
+                break
 
-    data = json.loads(texto.strip())
+    # Intentar reparar JSON truncado
+    try:
+        data = json.loads(texto.strip())
+    except json.JSONDecodeError:
+        # Truncar al último movimiento completo válido
+        ultimo_corchete = texto.rfind("},")
+        if ultimo_corchete > 0:
+            texto = texto[:ultimo_corchete+1] + "]}"
+        data = json.loads(texto.strip())
+
     return data.get("movimientos", [])
 
 def _parse_valor(s: str) -> float:
