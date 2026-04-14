@@ -698,7 +698,11 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
     try:
         log.info(f"Descargando PDF desde Twilio — URL: {media_url}")
         async with httpx.AsyncClient() as client:
-            resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+            resp = await client.get(
+                media_url,
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                follow_redirects=True
+            )
         log.info(f"PDF descargado — HTTP {resp.status_code}, {len(resp.content):,} bytes, Content-Type: {resp.headers.get('content-type', 'desconocido')}")
         if resp.status_code != 200:
             log.error(f"Error descargando PDF — HTTP {resp.status_code}: {resp.text[:200]}")
