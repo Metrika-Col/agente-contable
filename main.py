@@ -197,22 +197,35 @@ async def _parsear_con_claude_vision(pdf_bytes: bytes) -> list[dict]:
     import base64
     pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
-    prompt = """Analiza este extracto bancario y extrae TODOS los movimientos.
-Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin texto adicional:
+    prompt = """Analiza este extracto bancario de Bancolombia y extrae TODOS los movimientos.
+
+FORMATO DEL EXTRACTO:
+Las columnas son: FECHA | DESCRIPCIÓN | SUCURSAL | DCTO. | VALOR | SALDO
+
+REGLAS DE INTERPRETACIÓN:
+- FECHA viene en formato DD/MM sin año. Infiere el año desde el encabezado del extracto.
+- DESCRIPCIÓN es el concepto del movimiento (ej. "TRANSFERENCIAS A NEQUI").
+- DCTO. es el número de documento de referencia; puede estar vacío, en ese caso usa "".
+- VALOR negativo (con signo - o entre paréntesis) = cargo → va en "debito", "credito" = 0.
+- VALOR positivo = abono → va en "credito", "debito" = 0.
+- SALDO es el saldo después del movimiento.
+- Todos los valores numéricos deben ir sin puntos de miles ni comas decimales (solo número entero o con punto decimal si aplica).
+
+Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin texto adicional ni explicaciones:
 {
   "movimientos": [
     {
-      "fecha": "2025-01-02",
-      "doc": "TRF-0012341",
-      "concepto": "descripcion del movimiento",
-      "debito": 0,
-      "credito": 5200000,
-      "saldo": 23650000
+      "fecha": "2026-01-01",
+      "doc": "",
+      "concepto": "TRANSFERENCIAS A NEQUI",
+      "debito": 280000,
+      "credito": 0,
+      "saldo": 1553685.25
     }
   ]
 }
-Fechas en formato YYYY-MM-DD. Valores numéricos sin puntos ni comas.
-Si un campo no aplica usa 0."""
+
+Si un campo numérico no aplica usa 0. No incluyas texto fuera del JSON."""
 
     response = claude.messages.create(
         model="claude-opus-4-5",
