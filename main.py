@@ -697,18 +697,30 @@ async def webhook_whatsapp(
 async def procesar_extracto_pdf(numero: str, media_url: str):
     try:
         log.info(f"Descargando PDF desde Twilio — URL: {media_url}")
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            # Primer intento: con autenticación
             resp = await client.get(
                 media_url,
                 auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-                follow_redirects=True
+                follow_redirects=True,
+                timeout=30.0
             )
-        log.info(f"PDF descargado — HTTP {resp.status_code}, {len(resp.content):,} bytes, Content-Type: {resp.headers.get('content-type', 'desconocido')}")
-        if resp.status_code != 200:
-            log.error(f"Error descargando PDF — HTTP {resp.status_code}: {resp.text[:200]}")
-            enviar_whatsapp(numero, f"No pude descargar el archivo (HTTP {resp.status_code}). Intenta enviarlo de nuevo.")
-            return
+
+            # Si sigue redirigiendo sin auth, intentar sin credenciales
+            if resp.status_code in (301, 302, 307, 308):
+                resp = await client.get(
+                    str(resp.headers.get('location', media_url)),
+                    follow_redirects=True,
+                    timeout=30.0
+                )
+
+            if resp.status_code != 200:
+                log.error(f"Error descargando PDF: HTTP {resp.status_code}")
+                enviar_whatsapp(numero, f"No pude descargar el archivo (HTTP {resp.status_code}). Intenta enviarlo de nuevo.")
+                return
+
         pdf_bytes = resp.content
+        log.info(f"PDF descargado OK — {len(pdf_bytes)} bytes")
         mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
             enviar_whatsapp(numero, "No pude leer los movimientos del PDF. Asegurate que sea un extracto de Bancolombia en texto.")
