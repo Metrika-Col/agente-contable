@@ -92,34 +92,42 @@ TONO:
 - Cuando generes un Excel, avisa que lo estás preparando"""
 
 async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
+    log.info(f"Iniciando parser — PDF recibido: {len(pdf_bytes):,} bytes")
 
     # NIVEL 1: pdfplumber — tablas estructuradas
+    log.info("Parser nivel 1: intentando pdfplumber (tablas)...")
     try:
         movimientos = _parsear_con_pdfplumber(pdf_bytes)
         if movimientos:
-            log.info(f"Parser nivel 1 (pdfplumber): {len(movimientos)} movimientos")
+            log.info(f"Parser nivel 1 OK — {len(movimientos)} movimientos extraídos")
             return movimientos
+        log.info("Parser nivel 1: sin resultados, pasando al nivel 2")
     except Exception as e:
-        log.warning(f"pdfplumber falló: {e}")
+        log.error(f"Parser nivel 1 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
     # NIVEL 2: pdfplumber texto plano con regex
+    log.info("Parser nivel 2: intentando texto plano (regex Bancolombia)...")
     try:
         movimientos = _parsear_con_texto_plano(pdf_bytes)
         if movimientos:
-            log.info(f"Parser nivel 2 (texto plano): {len(movimientos)} movimientos")
+            log.info(f"Parser nivel 2 OK — {len(movimientos)} movimientos extraídos")
             return movimientos
+        log.info("Parser nivel 2: sin resultados, pasando al nivel 3")
     except Exception as e:
-        log.warning(f"Texto plano falló: {e}")
+        log.error(f"Parser nivel 2 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
     # NIVEL 3: Claude Vision — funciona con cualquier PDF
+    log.info("Parser nivel 3: intentando Claude Vision...")
     try:
         movimientos = await _parsear_con_claude_vision(pdf_bytes)
         if movimientos:
-            log.info(f"Parser nivel 3 (Claude Vision): {len(movimientos)} movimientos")
+            log.info(f"Parser nivel 3 OK — {len(movimientos)} movimientos extraídos")
             return movimientos
+        log.info("Parser nivel 3: sin resultados — el PDF no pudo ser procesado")
     except Exception as e:
-        log.warning(f"Claude Vision falló: {e}")
+        log.error(f"Parser nivel 3 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
+    log.error("Todos los niveles del parser fallaron o devolvieron 0 movimientos")
     return []
 
 
@@ -688,9 +696,15 @@ async def webhook_whatsapp(
 
 async def procesar_extracto_pdf(numero: str, media_url: str):
     try:
+        log.info(f"Descargando PDF desde Twilio — URL: {media_url}")
         async with httpx.AsyncClient() as client:
             resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-            pdf_bytes = resp.content
+        log.info(f"PDF descargado — HTTP {resp.status_code}, {len(resp.content):,} bytes, Content-Type: {resp.headers.get('content-type', 'desconocido')}")
+        if resp.status_code != 200:
+            log.error(f"Error descargando PDF — HTTP {resp.status_code}: {resp.text[:200]}")
+            enviar_whatsapp(numero, f"No pude descargar el archivo (HTTP {resp.status_code}). Intenta enviarlo de nuevo.")
+            return
+        pdf_bytes = resp.content
         mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
             enviar_whatsapp(numero, "No pude leer los movimientos del PDF. Asegurate que sea un extracto de Bancolombia en texto.")
