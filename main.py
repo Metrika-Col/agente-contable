@@ -13,7 +13,7 @@ from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
                               numbers as xl_numbers)
 from openpyxl.utils import get_column_letter
 
-from fastapi import FastAPI, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 import anthropic
 from twilio.rest import Client as TwilioClient
@@ -662,6 +662,35 @@ def descargar_archivo(filename: str):
         raise HTTPException(404, "Archivo no encontrado")
     return FileResponse(path, filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.post("/procesar-pdf")
+async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
+    """Endpoint directo para subir PDF desde la interfaz web."""
+    try:
+        pdf_bytes = await pdf.read()
+        log.info(f"PDF recibido por web — {len(pdf_bytes):,} bytes, filename: {pdf.filename}")
+        mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
+        if not mov_banco:
+            raise HTTPException(422, "No se pudieron extraer movimientos del PDF")
+        resultado = conciliar(mov_banco)
+        excel_bytes = generar_excel_conciliacion(resultado)
+        filename = f"Conciliacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        url_excel = subir_excel_twilio(excel_bytes, filename)
+        return JSONResponse({
+            "status": "ok",
+            "movimientos": len(mov_banco),
+            "resumen": resultado["resumen"],
+            "excel_url": url_excel,
+            "conciliados": resultado["conciliados"],
+            "solo_banco": resultado["solo_banco"],
+            "solo_conta": resultado["solo_conta"],
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Error en /procesar-pdf: {e}", exc_info=True)
+        raise HTTPException(500, f"Error procesando PDF: {str(e)}")
+
 
 @app.post("/webhook/whatsapp")
 async def webhook_whatsapp(
