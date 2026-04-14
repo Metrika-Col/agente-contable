@@ -676,11 +676,26 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
         excel_bytes = generar_excel_conciliacion(resultado)
         filename = f"Conciliacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         url_excel = subir_excel_twilio(excel_bytes, filename)
+        # Transformar mov_banco al formato que usa la interfaz web
+        movimientos_banco = [
+            {
+                "id": f"t{i+1}",
+                "fecha": m["fecha"],
+                "descripcion": m["concepto"],
+                "doc": m.get("doc", ""),
+                "valor": m["credito"] if m["credito"] > 0 else m["debito"],
+                "tipo": "CR" if m["credito"] > 0 else "DB",
+                "cuenta_puc": None,
+                "aprobado": False,
+            }
+            for i, m in enumerate(mov_banco)
+        ]
         return JSONResponse({
             "status": "ok",
             "movimientos": len(mov_banco),
             "resumen": resultado["resumen"],
             "excel_url": url_excel,
+            "movimientos_banco": movimientos_banco,
             "conciliados": resultado["conciliados"],
             "solo_banco": resultado["solo_banco"],
             "solo_conta": resultado["solo_conta"],
