@@ -91,7 +91,39 @@ TONO:
 - Usa emojis contables con moderación: ✅ ❌ ⚠️ 📊 💰
 - Cuando generes un Excel, avisa que lo estás preparando"""
 
-def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
+async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
+
+    # NIVEL 1: pdfplumber — tablas estructuradas
+    try:
+        movimientos = _parsear_con_pdfplumber(pdf_bytes)
+        if movimientos:
+            log.info(f"Parser nivel 1 (pdfplumber): {len(movimientos)} movimientos")
+            return movimientos
+    except Exception as e:
+        log.warning(f"pdfplumber falló: {e}")
+
+    # NIVEL 2: pdfplumber texto plano con regex
+    try:
+        movimientos = _parsear_con_texto_plano(pdf_bytes)
+        if movimientos:
+            log.info(f"Parser nivel 2 (texto plano): {len(movimientos)} movimientos")
+            return movimientos
+    except Exception as e:
+        log.warning(f"Texto plano falló: {e}")
+
+    # NIVEL 3: Claude Vision — funciona con cualquier PDF
+    try:
+        movimientos = await _parsear_con_claude_vision(pdf_bytes)
+        if movimientos:
+            log.info(f"Parser nivel 3 (Claude Vision): {len(movimientos)} movimientos")
+            return movimientos
+    except Exception as e:
+        log.warning(f"Claude Vision falló: {e}")
+
+    return []
+
+
+def _parsear_con_pdfplumber(pdf_bytes: bytes) -> list[dict]:
     movimientos = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -105,22 +137,96 @@ def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
                         continue
                     try:
                         fecha = datetime.strptime(fecha_str, "%d/%m/%Y").date()
-                        doc      = str(row[1]).strip() if row[1] else ""
-                        concepto = str(row[2]).strip() if row[2] else ""
-                        debito   = _parse_valor(str(row[3]) if row[3] else "")
-                        credito  = _parse_valor(str(row[4]) if len(row) > 4 and row[4] else "")
-                        saldo    = _parse_valor(str(row[5]) if len(row) > 5 and row[5] else "")
                         movimientos.append({
                             "fecha": str(fecha),
-                            "doc": doc,
-                            "concepto": concepto,
-                            "debito": debito,
-                            "credito": credito,
-                            "saldo": saldo,
+                            "doc": str(row[1]).strip() if row[1] else "",
+                            "concepto": str(row[2]).strip() if row[2] else "",
+                            "debito": _parse_valor(str(row[3]) if row[3] else ""),
+                            "credito": _parse_valor(str(row[4]) if len(row) > 4 and row[4] else ""),
+                            "saldo": _parse_valor(str(row[5]) if len(row) > 5 and row[5] else ""),
                         })
                     except Exception:
                         continue
     return movimientos
+
+
+def _parsear_con_texto_plano(pdf_bytes: bytes) -> list[dict]:
+    movimientos = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.split("\n"):
+                match = re.match(
+                    r"(\d{2}/\d{2}/\d{4})\s+(\S+)\s+(.+?)\s+([\d.,]+)?\s+([\d.,]+)?\s+([\d.,]+)?$",
+                    line.strip()
+                )
+                if match:
+                    try:
+                        fecha = datetime.strptime(match.group(1), "%d/%m/%Y").date()
+                        movimientos.append({
+                            "fecha": str(fecha),
+                            "doc": match.group(2).strip(),
+                            "concepto": match.group(3).strip(),
+                            "debito": _parse_valor(match.group(4) or ""),
+                            "credito": _parse_valor(match.group(5) or ""),
+                            "saldo": _parse_valor(match.group(6) or ""),
+                        })
+                    except Exception:
+                        continue
+    return movimientos
+
+
+async def _parsear_con_claude_vision(pdf_bytes: bytes) -> list[dict]:
+    import base64
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    prompt = """Analiza este extracto bancario y extrae TODOS los movimientos.
+Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin texto adicional:
+{
+  "movimientos": [
+    {
+      "fecha": "2025-01-02",
+      "doc": "TRF-0012341",
+      "concepto": "descripcion del movimiento",
+      "debito": 0,
+      "credito": 5200000,
+      "saldo": 23650000
+    }
+  ]
+}
+Fechas en formato YYYY-MM-DD. Valores numéricos sin puntos ni comas.
+Si un campo no aplica usa 0."""
+
+    response = claude.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=4000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": pdf_b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }]
+    )
+
+    texto = response.content[0].text.strip()
+    if "```" in texto:
+        texto = texto.split("```")[1]
+        if texto.startswith("json"):
+            texto = texto[4:]
+
+    data = json.loads(texto.strip())
+    return data.get("movimientos", [])
 
 def _parse_valor(s: str) -> float:
     s = s.strip().replace("$", "").replace(".", "").replace(",", "").replace(" ", "")
@@ -537,7 +643,7 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
         async with httpx.AsyncClient() as client:
             resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
             pdf_bytes = resp.content
-        mov_banco = parsear_extracto_bancolombia(pdf_bytes)
+        mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
             enviar_whatsapp(numero, "No pude leer los movimientos del PDF. Asegurate que sea un extracto de Bancolombia en texto.")
             return
