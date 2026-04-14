@@ -760,7 +760,18 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
         if proximos > 0:
             msg += f"{proximos} pago(s) proximo(s) a vencer\n"
         msg += "\nTe adjunto el Excel con el detalle completo (5 hojas)."
-        enviar_whatsapp_media(numero, msg, url_excel)
+        # Enviar resumen primero (siempre funciona)
+        enviar_whatsapp(numero, msg)
+
+        # Intentar enviar Excel como media
+        try:
+            enviar_whatsapp_media(numero,
+                "Aqui tu Excel de conciliacion:", url_excel)
+        except Exception as e:
+            log.error(f"Error enviando media: {e}")
+            # Si falla, enviar link directo
+            enviar_whatsapp(numero,
+                f"Descarga tu Excel aqui:\n{url_excel}")
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         enviar_whatsapp(numero, "Ocurrio un error procesando el extracto. Intenta de nuevo.")
