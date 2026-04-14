@@ -151,25 +151,42 @@ def _parsear_con_pdfplumber(pdf_bytes: bytes) -> list[dict]:
 
 
 def _parsear_con_texto_plano(pdf_bytes: bytes) -> list[dict]:
+    """
+    Formato real Bancolombia:
+    FECHA | DESCRIPCIÓN | SUCURSAL | DCTO. | VALOR | SALDO
+    VALOR es positivo (abono/crédito) o negativo (cargo/débito).
+    """
     movimientos = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             for line in text.split("\n"):
+                # Formato Bancolombia: fecha  descripcion  sucursal  dcto  valor  saldo
+                # VALOR puede ser -1.234.567,89 o 1.234.567,89
                 match = re.match(
-                    r"(\d{2}/\d{2}/\d{4})\s+(\S+)\s+(.+?)\s+([\d.,]+)?\s+([\d.,]+)?\s+([\d.,]+)?$",
+                    r"(\d{2}/\d{2}/\d{4})\s+"   # fecha
+                    r"(.+?)\s+"                  # descripcion
+                    r"(\S+)\s+"                  # sucursal
+                    r"(\S*)\s+"                  # dcto (puede estar vacío)
+                    r"(-?[\d.,]+)\s+"            # valor (positivo o negativo)
+                    r"(-?[\d.,]+)$",             # saldo
                     line.strip()
                 )
                 if match:
                     try:
                         fecha = datetime.strptime(match.group(1), "%d/%m/%Y").date()
+                        dcto  = match.group(4).strip()
+                        valor = _parse_valor(match.group(5))
+                        saldo = _parse_valor(match.group(6))
+                        debito  = abs(valor) if valor < 0 else 0.0
+                        credito = valor       if valor > 0 else 0.0
                         movimientos.append({
-                            "fecha": str(fecha),
-                            "doc": match.group(2).strip(),
-                            "concepto": match.group(3).strip(),
-                            "debito": _parse_valor(match.group(4) or ""),
-                            "credito": _parse_valor(match.group(5) or ""),
-                            "saldo": _parse_valor(match.group(6) or ""),
+                            "fecha":    str(fecha),
+                            "doc":      dcto,
+                            "concepto": match.group(2).strip(),
+                            "debito":   debito,
+                            "credito":  credito,
+                            "saldo":    abs(saldo),
                         })
                     except Exception:
                         continue
@@ -243,12 +260,30 @@ def conciliar(mov_banco: list[dict]) -> dict:
 
     for mb in mov_banco:
         match = None
-        for rc in registros:
-            if rc["conciliado"]:
-                continue
-            if mb["doc"] and mb["doc"] == rc["doc"]:
-                match = rc
-                break
+        mb_valor = mb["debito"] or mb["credito"]
+
+        # Intento 1: match por número de documento
+        if mb["doc"]:
+            for rc in registros:
+                if rc["conciliado"]:
+                    continue
+                if mb["doc"] == rc["doc"]:
+                    match = rc
+                    break
+
+        # Intento 2 (doc vacío): match por valor + fecha (±1 día de tolerancia)
+        if match is None:
+            mb_fecha = datetime.strptime(mb["fecha"], "%Y-%m-%d").date()
+            for rc in registros:
+                if rc["conciliado"]:
+                    continue
+                rc_fecha = datetime.strptime(rc["fecha"], "%Y-%m-%d").date()
+                fecha_ok = abs((mb_fecha - rc_fecha).days) <= 1
+                valor_ok = mb_valor and abs(mb_valor - rc["valor"]) < 1
+                if fecha_ok and valor_ok:
+                    match = rc
+                    break
+
         if match:
             match["conciliado"] = True
             conciliados.append({
