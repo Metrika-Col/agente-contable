@@ -176,50 +176,133 @@ def fmt_cop(n: float) -> str:
 async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
     log.info(f"Iniciando parser — PDF recibido: {len(pdf_bytes):,} bytes")
 
-    # NIVEL 1: pdfplumber — tablas estructuradas
-    log.info("Parser nivel 1: intentando pdfplumber (tablas)...")
+    # NIVEL 1: texto plano + regex — formato real Bancolombia Ahorros (D/MM valor saldo)
+    log.info("Parser nivel 1: texto plano + regex Bancolombia ahorros...")
     try:
-        movimientos = _parsear_con_pdfplumber(pdf_bytes)
-        if movimientos:
+        movimientos = _parsear_bancolombia_ahorros(pdf_bytes)
+        if len(movimientos) > 10:
             log.info(f"Parser nivel 1 OK — {len(movimientos)} movimientos extraídos")
             return movimientos
-        log.info("Parser nivel 1: sin resultados, pasando al nivel 2")
+        log.info(f"Parser nivel 1: {len(movimientos)} mov (umbral 10), pasando al nivel 2")
     except Exception as e:
         log.error(f"Parser nivel 1 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
-    # NIVEL 2: pdfplumber texto plano con regex
-    log.info("Parser nivel 2: intentando texto plano (regex Bancolombia)...")
+    # NIVEL 2: tablas pdfplumber — PDFs estructurados con fecha DD/MM/YYYY completa
+    log.info("Parser nivel 2: pdfplumber tablas (fecha completa)...")
     try:
-        movimientos = _parsear_con_texto_plano(pdf_bytes)
+        movimientos = _parsear_con_tablas(pdf_bytes)
         if movimientos:
             log.info(f"Parser nivel 2 OK — {len(movimientos)} movimientos extraídos")
             return movimientos
-        log.info("Parser nivel 2: sin resultados, pasando al nivel 3")
+        log.info("Parser nivel 2: sin resultados — PDF no compatible")
     except Exception as e:
         log.error(f"Parser nivel 2 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
-    # NIVEL 3: Claude Vision — funciona con cualquier PDF
-    log.info("Parser nivel 3: intentando Claude Vision...")
-    try:
-        movimientos = await _parsear_con_claude_vision(pdf_bytes)
-        if movimientos:
-            log.info(f"Parser nivel 3 OK — {len(movimientos)} movimientos extraídos")
-            return movimientos
-        log.info("Parser nivel 3: sin resultados — el PDF no pudo ser procesado")
-    except Exception as e:
-        log.error(f"Parser nivel 3 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
-
-    log.error("Todos los niveles del parser fallaron o devolvieron 0 movimientos")
+    log.error("Ambos parsers fallaron o devolvieron 0 movimientos")
     return []
 
 
-def _parsear_con_pdfplumber(pdf_bytes: bytes) -> list[dict]:
-    movimientos = []
+# ── Regex para líneas de transacción Bancolombia Ahorros ────────────────────
+# Formato extraído por pdfplumber (columnas SUCURSAL y DCTO. ausentes en texto):
+#   D/MM   DESCRIPCION                      VALOR         SALDO
+#   1/01   ABONO INTERESES AHORROS          2.12          1,833,685.25
+#   2/01   TRANSFERENCIAS A NEQUI           -25,000.00    1,528,686.04
+#   15/01  PAGO DE NOMI HADA INTERNATIO     2,354,481.00  2,392,605.26
+#
+# Números: coma = miles, punto = decimal  (e.g. 1,833,685.25 = 1.833.685,25 COP)
+# Valor negativo = cargo (débito); positivo = abono (crédito)
+_RX_BANC_TX = re.compile(
+    r"^(\d{1,2}/\d{2})"           # D/MM  (sin año)
+    r"\s+(.+?)"                    # descripcion (lazy, cualquier texto)
+    r"\s+(-?[\d,]*\.\d{2})"       # valor: -?miles.centavos  ej. -25,000.00 | 2.12 | .79
+    r"\s+([\d,]+\.\d{2})\s*$"     # saldo: siempre positivo  ej. 1,833,685.25
+)
+_RX_DESDE = re.compile(r"DESDE:\s*(\d{4})/(\d{2})/\d{2}")
+
+
+def _parsear_bancolombia_ahorros(pdf_bytes: bytes) -> list[dict]:
+    """
+    Parser nivel 1 — Bancolombia Cuenta de Ahorros (Estado de Cuenta).
+
+    pdfplumber omite columnas SUCURSAL y DCTO. cuando están vacías,
+    dejando solo: D/MM  DESCRIPCION  VALOR  SALDO
+
+    Inferencia de año:
+      - Se lee 'DESDE: YYYY/MM/DD' del encabezado para obtener año y mes de inicio.
+      - Se incrementa el año cuando el mes de una transacción es menor al mes anterior
+        (rollover de año, ej. diciembre → enero).
+    """
+    movimientos: list[dict] = []
+    desde_year  = datetime.now().year
+    desde_month = 1
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # Paso 1: recopilar texto de todas las páginas
+        pages_text: list[str] = []
+        all_text = ""
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            pages_text.append(t)
+            all_text += t + "\n"
+
+        # Paso 2: extraer año y mes de inicio del encabezado
+        m = _RX_DESDE.search(all_text)
+        if m:
+            desde_year  = int(m.group(1))
+            desde_month = int(m.group(2))
+
+        # Paso 3: parsear transacciones con detección de rollover de año
+        current_year = desde_year
+        prev_month   = desde_month
+
+        for text in pages_text:
+            for line in text.split("\n"):
+                line = line.strip()
+                mx = _RX_BANC_TX.match(line)
+                if not mx:
+                    continue
+
+                fecha_str, concepto, valor_str, saldo_str = mx.groups()
+                day_s, month_s = fecha_str.split("/")
+                tx_month = int(month_s)
+                tx_day   = int(day_s)
+
+                # Rollover de año: si el mes retrocede (ej. 12 → 1)
+                if tx_month < prev_month:
+                    current_year += 1
+                prev_month = tx_month
+
+                try:
+                    fecha   = datetime(current_year, tx_month, tx_day).date()
+                    valor   = _parse_valor_banc(valor_str)
+                    saldo   = _parse_valor_banc(saldo_str)
+                    debito  = abs(valor) if valor < 0 else 0.0
+                    credito = valor      if valor > 0 else 0.0
+                    movimientos.append({
+                        "fecha":    str(fecha),
+                        "doc":      "",
+                        "concepto": concepto.strip(),
+                        "debito":   debito,
+                        "credito":  credito,
+                        "saldo":    saldo,
+                    })
+                except (ValueError, Exception):
+                    continue
+
+    return movimientos
+
+
+def _parsear_con_tablas(pdf_bytes: bytes) -> list[dict]:
+    """
+    Parser nivel 2 — PDFs estructurados con tabla y fecha completa DD/MM/YYYY.
+    Fallback para extractos de Cuenta Corriente o formatos con DCTO. explícito.
+    Números en formato colombiano: punto = miles, coma = decimal.
+    """
+    movimientos: list[dict] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
+            for table in (page.extract_tables() or []):
+                for row in (table or []):
                     if not row or len(row) < 4:
                         continue
                     fecha_str = str(row[0]).strip() if row[0] else ""
@@ -228,142 +311,36 @@ def _parsear_con_pdfplumber(pdf_bytes: bytes) -> list[dict]:
                     try:
                         fecha = datetime.strptime(fecha_str, "%d/%m/%Y").date()
                         movimientos.append({
-                            "fecha": str(fecha),
-                            "doc": str(row[1]).strip() if row[1] else "",
-                            "concepto": str(row[2]).strip() if row[2] else "",
-                            "debito": _parse_valor(str(row[3]) if row[3] else ""),
-                            "credito": _parse_valor(str(row[4]) if len(row) > 4 and row[4] else ""),
-                            "saldo": _parse_valor(str(row[5]) if len(row) > 5 and row[5] else ""),
-                        })
-                    except Exception:
-                        continue
-    return movimientos
-
-
-def _parsear_con_texto_plano(pdf_bytes: bytes) -> list[dict]:
-    """
-    Formato real Bancolombia:
-    FECHA | DESCRIPCIÓN | SUCURSAL | DCTO. | VALOR | SALDO
-    VALOR es positivo (abono/crédito) o negativo (cargo/débito).
-    """
-    movimientos = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            for line in text.split("\n"):
-                # Formato Bancolombia: fecha  descripcion  sucursal  dcto  valor  saldo
-                # VALOR puede ser -1.234.567,89 o 1.234.567,89
-                match = re.match(
-                    r"(\d{2}/\d{2}/\d{4})\s+"   # fecha
-                    r"(.+?)\s+"                  # descripcion
-                    r"(\S+)\s+"                  # sucursal
-                    r"(\S*)\s+"                  # dcto (puede estar vacío)
-                    r"(-?[\d.,]+)\s+"            # valor (positivo o negativo)
-                    r"(-?[\d.,]+)$",             # saldo
-                    line.strip()
-                )
-                if match:
-                    try:
-                        fecha = datetime.strptime(match.group(1), "%d/%m/%Y").date()
-                        dcto  = match.group(4).strip()
-                        valor = _parse_valor(match.group(5))
-                        saldo = _parse_valor(match.group(6))
-                        debito  = abs(valor) if valor < 0 else 0.0
-                        credito = valor       if valor > 0 else 0.0
-                        movimientos.append({
                             "fecha":    str(fecha),
-                            "doc":      dcto,
-                            "concepto": match.group(2).strip(),
-                            "debito":   debito,
-                            "credito":  credito,
-                            "saldo":    abs(saldo),
+                            "doc":      str(row[1]).strip() if row[1] else "",
+                            "concepto": str(row[2]).strip() if row[2] else "",
+                            "debito":   _parse_valor_co(str(row[3]) if row[3] else ""),
+                            "credito":  _parse_valor_co(str(row[4]) if len(row) > 4 and row[4] else ""),
+                            "saldo":    _parse_valor_co(str(row[5]) if len(row) > 5 and row[5] else ""),
                         })
                     except Exception:
                         continue
     return movimientos
 
 
-async def _parsear_con_claude_vision(pdf_bytes: bytes) -> list[dict]:
-    import base64
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-
-    prompt = """Analiza este extracto bancario de Bancolombia y extrae TODOS los movimientos.
-
-FORMATO DEL EXTRACTO:
-Las columnas son: FECHA | DESCRIPCIÓN | SUCURSAL | DCTO. | VALOR | SALDO
-
-REGLAS DE INTERPRETACIÓN:
-- FECHA viene en formato DD/MM sin año. Infiere el año desde el encabezado del extracto.
-- DESCRIPCIÓN es el concepto del movimiento (ej. "TRANSFERENCIAS A NEQUI").
-- DCTO. es el número de documento de referencia; puede estar vacío, en ese caso usa "".
-- VALOR negativo (con signo - o entre paréntesis) = cargo → va en "debito", "credito" = 0.
-- VALOR positivo = abono → va en "credito", "debito" = 0.
-- SALDO es el saldo después del movimiento.
-- Todos los valores numéricos deben ir sin puntos de miles ni comas decimales (solo número entero o con punto decimal si aplica).
-
-Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin texto adicional ni explicaciones:
-{
-  "movimientos": [
-    {
-      "fecha": "2026-01-01",
-      "doc": "",
-      "concepto": "TRANSFERENCIAS A NEQUI",
-      "debito": 280000,
-      "credito": 0,
-      "saldo": 1553685.25
-    }
-  ]
-}
-
-Si un campo numérico no aplica usa 0. No incluyas texto fuera del JSON."""
-
-    response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=2000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": pdf_b64
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ]
-        }]
-    )
-
-    texto = response.content[0].text.strip()
-    if "```" in texto:
-        partes = texto.split("```")
-        for parte in partes:
-            if parte.startswith("json"):
-                texto = parte[4:]
-                break
-            elif "{" in parte:
-                texto = parte
-                break
-
-    # Intentar reparar JSON truncado
+def _parse_valor_banc(s: str) -> float:
+    """
+    Formato Bancolombia Ahorros: coma=miles, punto=decimal.
+    Ejemplos: '1,833,685.25' → 1833685.25 | '-25,000.00' → -25000.0 | '.79' → 0.79
+    """
+    s = s.strip().replace("$", "").replace(",", "").replace(" ", "")
     try:
-        data = json.loads(texto.strip())
-    except json.JSONDecodeError:
-        # Truncar al último movimiento completo válido
-        ultimo_corchete = texto.rfind("},")
-        if ultimo_corchete > 0:
-            texto = texto[:ultimo_corchete+1] + "]}"
-        data = json.loads(texto.strip())
+        return float(s)
+    except Exception:
+        return 0.0
 
-    return data.get("movimientos", [])
 
-def _parse_valor(s: str) -> float:
-    s = s.strip().replace("$", "").replace(".", "").replace(",", "").replace(" ", "")
+def _parse_valor_co(s: str) -> float:
+    """
+    Formato colombiano: punto=miles, coma=decimal.
+    Ejemplos: '5.200.000' → 5200000.0 | '1.234,56' → 1234.56
+    """
+    s = s.strip().replace("$", "").replace(".", "").replace(",", ".").replace(" ", "")
     try:
         return float(s)
     except Exception:
