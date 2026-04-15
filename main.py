@@ -91,6 +91,88 @@ TONO:
 - Usa emojis contables con moderación: ✅ ❌ ⚠️ 📊 💰
 - Cuando generes un Excel, avisa que lo estás preparando"""
 
+# ─── Sesiones por número de teléfono (TTL 24 h) ──────────────────────────────
+from dataclasses import dataclass, field as dc_field
+
+@dataclass
+class SesionExtracto:
+    mov_banco:   list[dict]
+    resumen:     dict          # totales pre-calculados
+    clasificados: list[dict]   # mov_banco con cuenta_puc asignada
+    timestamp:   datetime = dc_field(default_factory=datetime.now)
+
+SESIONES: dict[str, SesionExtracto] = {}
+SESION_TTL_HORAS = 24
+
+def limpiar_sesiones_expiradas():
+    ahora = datetime.now()
+    expiradas = [n for n, s in SESIONES.items()
+                 if (ahora - s.timestamp).total_seconds() > SESION_TTL_HORAS * 3600]
+    for n in expiradas:
+        del SESIONES[n]
+        log.info(f"Sesión expirada eliminada: {n}")
+
+# ─── Reglas locales de clasificación PUC ─────────────────────────────────────
+REGLAS_PUC_LOCAL = [
+    # Clave: lista de substrings en descripción (lowercase) → (código PUC, nombre)
+    (["intereses ahorros", "abono intereses", "intereses"],  "1110", "Bancos"),
+    (["nequi", "transferencia nequi"],                        "1305", "Clientes"),
+    (["nomina", "nomi ", "salario", "empleado"],              "5105", "Gastos de personal"),
+    (["farmatodo", "farmacia", "drogueria", "drogas"],        "5305", "Otros gastos operacionales"),
+    (["mercadopago", "mercado pago"],                         "2205", "Proveedores nacionales"),
+    (["claude.ai", "subscri", "suscripci"],                   "5305", "Otros gastos operacionales"),
+    (["gmf", "4x1000", "gravamen movimiento"],                "5305", "Otros gastos operacionales"),
+    (["combustible", "gasolina", "combustibl"],               "5210", "Gastos de viaje"),
+    (["retenci", "retencion", "ret. fte"],                    "2365", "Retención en la fuente a pagar"),
+    (["iva ", "impuesto ventas"],                             "2408", "IVA generado"),
+    (["energia", "electrica", "epm ", "codensa"],             "5115", "Servicios públicos"),
+    (["acueducto", "agua ", "triple a"],                      "5115", "Servicios públicos"),
+    (["telefon", "celular", "internet", "claro", "movistar"], "5120", "Comunicaciones"),
+    (["arrend", "alquiler", "canon"],                         "5135", "Arrendamientos"),
+    (["seguro", "prima ", "bolivar", "sura "],                "5165", "Seguros"),
+    (["pago nomi", "pago de nomi"],                           "5105", "Gastos de personal"),
+    (["transferencia"],                                        "1110", "Bancos"),
+]
+
+def clasificar_con_reglas_locales(mov_banco: list[dict]) -> list[dict]:
+    """Añade cuenta_puc a cada movimiento usando reglas keyword → PUC."""
+    resultado = []
+    for m in mov_banco:
+        desc = m.get("concepto", "").lower()
+        cuenta, nombre = None, None
+        for keywords, cod, nom in REGLAS_PUC_LOCAL:
+            if any(k in desc for k in keywords):
+                cuenta, nombre = cod, nom
+                break
+        resultado.append({**m, "cuenta_puc": cuenta, "nombre_puc": nombre})
+    return resultado
+
+def computar_resumen_wa(mov_banco: list[dict]) -> dict:
+    """Calcula totales y top 10 para la sesión y mensajes de WhatsApp."""
+    ingresos = sum(m["credito"] for m in mov_banco)
+    egresos  = sum(m["debito"]  for m in mov_banco)
+    top10 = sorted(mov_banco, key=lambda m: m["credito"] + m["debito"], reverse=True)[:10]
+    # Distribución por cuenta PUC (requiere clasificacion previa)
+    dist: dict[str, dict] = {}
+    for m in mov_banco:
+        cod = m.get("cuenta_puc") or "Sin clasificar"
+        nom = m.get("nombre_puc") or "Sin clasificar"
+        if cod not in dist:
+            dist[cod] = {"nombre": nom, "n": 0, "total": 0.0}
+        dist[cod]["n"] += 1
+        dist[cod]["total"] += m["credito"] + m["debito"]
+    return {
+        "total_tx": len(mov_banco),
+        "ingresos": ingresos,
+        "egresos":  egresos,
+        "saldo":    ingresos - egresos,
+        "top10":    top10,
+        "por_cuenta": dist,
+    }
+
+def fmt_cop(n: float) -> str:
+    return f"${n:,.0f}".replace(",", ".")
+
 async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
     log.info(f"Iniciando parser — PDF recibido: {len(pdf_bytes):,} bytes")
 
@@ -716,109 +798,152 @@ async def webhook_whatsapp(
     MediaUrl0: str = Form(default=""),
     MediaContentType0: str = Form(default=""),
 ):
-    numero = From.replace("whatsapp:", "")
+    limpiar_sesiones_expiradas()
+    numero  = From.replace("whatsapp:", "")
     mensaje = Body.strip().lower()
-    log.info(f"Mensaje de {numero}: '{Body}'")
+    log.info(f"WA {numero}: '{Body[:80]}'")
 
+    # ── PDF adjunto → procesar y guardar sesión ──────────────────────────────
     if int(NumMedia) > 0 and "pdf" in MediaContentType0.lower():
         background_tasks.add_task(procesar_extracto_pdf, numero, MediaUrl0)
         enviar_whatsapp(numero,
-            "Recibi tu extracto bancario. Estoy procesando la conciliacion... en unos segundos te envio el Excel con el resultado.")
+            "📄 Recibí tu extracto. Procesando... en unos segundos te envío el resumen.")
         return {"status": "procesando"}
 
-    if any(k in mensaje for k in ["conciliar","conciliacion","extracto"]):
-        enviar_whatsapp(numero,
-            "Para hacer la conciliacion bancaria, enviame el extracto en PDF por este chat. Acepto extractos de Bancolombia.")
+    sesion: SesionExtracto | None = SESIONES.get(numero)
+
+    # ── Comando: clasificar ──────────────────────────────────────────────────
+    if "clasificar" in mensaje:
+        if not sesion:
+            enviar_whatsapp(numero, "⚠️ No hay extracto cargado. Envíame primero el PDF de Bancolombia.")
+            return {"status": "ok"}
+        top10 = sesion.resumen["top10"][:10]
+        lineas = []
+        for m in top10:
+            val  = m["credito"] if m["credito"] > 0 else -m["debito"]
+            puc  = m.get("cuenta_puc") or "—"
+            nom  = m.get("nombre_puc") or "Sin clasificar"
+            signo = "✅" if m["credito"] > 0 else "🔴"
+            lineas.append(f"{signo} {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(abs(val))} | PUC {puc}")
+        msg = "📊 *Top 10 Transacciones con PUC*\n\n" + "\n".join(lineas)
+        enviar_whatsapp(numero, msg)
         return {"status": "ok"}
 
-    if any(k in mensaje for k in ["pagos","pendientes","vencimientos","proveedores"]):
+    # ── Comando: saldo ───────────────────────────────────────────────────────
+    if mensaje in ("saldo", "saldo actual", "mi saldo", "ver saldo"):
+        if not sesion:
+            enviar_whatsapp(numero, "⚠️ No hay extracto cargado. Envíame primero el PDF de Bancolombia.")
+            return {"status": "ok"}
+        r = sesion.resumen
+        msg = (
+            f"💰 *Saldo del extracto*\n\n"
+            f"💚 Ingresos: {fmt_cop(r['ingresos'])}\n"
+            f"🔴 Egresos:  {fmt_cop(r['egresos'])}\n"
+            f"💰 Saldo neto: {fmt_cop(r['saldo'])}\n\n"
+            f"📋 {r['total_tx']} transacciones en el período"
+        )
+        enviar_whatsapp(numero, msg)
+        return {"status": "ok"}
+
+    # ── Comando: pagos pendientes ────────────────────────────────────────────
+    if any(k in mensaje for k in ["pagos", "pendientes", "vencimientos", "proveedores"]):
         background_tasks.add_task(reporte_pagos_pendientes, numero)
         return {"status": "ok"}
 
-    if any(k in mensaje for k in ["impuestos","fiscal","tributario","dian","obligaciones"]):
+    # ── Comando: impuestos / DIAN ────────────────────────────────────────────
+    if any(k in mensaje for k in ["impuestos", "fiscal", "tributario", "dian", "obligaciones"]):
         background_tasks.add_task(reporte_fiscal, numero)
         return {"status": "ok"}
 
-    if any(k in mensaje for k in ["ayuda","help","hola","buenas","buenos"]):
+    # ── Saludo / ayuda ───────────────────────────────────────────────────────
+    if any(k in mensaje for k in ["ayuda", "help", "hola", "buenas", "buenos", "menu"]):
+        tiene_extracto = "✅ Extracto cargado" if sesion else "📄 Sin extracto — envía el PDF para comenzar"
         enviar_whatsapp(numero,
-            "Hola! Soy CONTA, tu Auxiliar Contable Inteligente de Metrika Group.\n\n"
-            "Puedo ayudarte con:\n"
-            "- Conciliacion bancaria: enviame el extracto en PDF\n"
-            "- Pagos pendientes: escribe 'pagos pendientes'\n"
-            "- Obligaciones fiscales: escribe 'impuestos'\n"
-            "- Consultas contables: preguntame lo que necesites")
+            f"¡Hola! Soy *CONTA*, tu Auxiliar Contable de Metrika Group.\n\n"
+            f"Estado: {tiene_extracto}\n\n"
+            f"Comandos disponibles:\n"
+            f"- Envía el *PDF* del extracto Bancolombia\n"
+            f"- *clasificar* → top 10 con cuenta PUC\n"
+            f"- *saldo* → resumen del período\n"
+            f"- *pagos pendientes* → proveedores\n"
+            f"- *impuestos* → calendario DIAN\n"
+            f"- Cualquier otra pregunta contable")
         return {"status": "ok"}
 
-    background_tasks.add_task(responder_consulta_libre, numero, Body)
+    # ── Consulta libre → Claude con contexto de sesión ───────────────────────
+    background_tasks.add_task(responder_consulta_libre, numero, Body, sesion)
     return {"status": "ok"}
 
 async def procesar_extracto_pdf(numero: str, media_url: str):
     try:
-        log.info(f"Descargando PDF desde Twilio — URL: {media_url}")
+        log.info(f"Descargando PDF — URL: {media_url}")
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            # Primer intento: con autenticación
             resp = await client.get(
                 media_url,
                 auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
                 follow_redirects=True,
-                timeout=30.0
+                timeout=30.0,
             )
-
-            # Si sigue redirigiendo sin auth, intentar sin credenciales
             if resp.status_code in (301, 302, 307, 308):
                 resp = await client.get(
-                    str(resp.headers.get('location', media_url)),
+                    str(resp.headers.get("location", media_url)),
                     follow_redirects=True,
-                    timeout=30.0
+                    timeout=30.0,
                 )
-
             if resp.status_code != 200:
-                log.error(f"Error descargando PDF: HTTP {resp.status_code}")
-                enviar_whatsapp(numero, f"No pude descargar el archivo (HTTP {resp.status_code}). Intenta enviarlo de nuevo.")
+                log.error(f"Error HTTP al descargar PDF: {resp.status_code}")
+                enviar_whatsapp(numero, f"❌ No pude descargar el archivo (HTTP {resp.status_code}). Intenta de nuevo.")
                 return
 
         pdf_bytes = resp.content
-        log.info(f"PDF descargado OK — {len(pdf_bytes)} bytes")
+        log.info(f"PDF descargado: {len(pdf_bytes):,} bytes")
+
         mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
-            enviar_whatsapp(numero, "No pude leer los movimientos del PDF. Asegurate que sea un extracto de Bancolombia en texto.")
+            enviar_whatsapp(numero, "❌ No pude leer los movimientos del PDF. Asegúrate de que sea un extracto Bancolombia en formato texto.")
             return
-        resultado = conciliar(mov_banco)
-        res = resultado["resumen"]
-        excel_bytes = generar_excel_conciliacion(resultado)
-        filename = f"Conciliacion_Enero2025_{datetime.now().strftime('%H%M%S')}.xlsx"
-        url_excel = subir_excel_twilio(excel_bytes, filename)
-        vencidos = sum(1 for p in PAGOS_PENDIENTES if p["estado"] == "VENCIDO")
-        proximos = sum(1 for p in PAGOS_PENDIENTES if p["estado"] == "PROXIMO")
-        msg = (
-            f"Conciliacion Enero 2025 lista!\n\n"
-            f"Resultado:\n"
-            f"- Movimientos conciliados: {res['total_conciliados']}\n"
-            f"- Solo en extracto banco: {res['total_solo_banco']}\n"
-            f"- Solo en contabilidad: {res['total_solo_conta']}\n\n"
-        )
-        if res["total_solo_banco"] + res["total_solo_conta"] > 0:
-            msg += f"Hay {res['total_solo_banco'] + res['total_solo_conta']} partidas abiertas que requieren revision.\n\n"
-        if vencidos > 0:
-            msg += f"{vencidos} pago(s) a proveedores VENCIDOS\n"
-        if proximos > 0:
-            msg += f"{proximos} pago(s) proximo(s) a vencer\n"
-        msg += "\nTe adjunto el Excel con el detalle completo (5 hojas)."
-        # Enviar resumen primero (siempre funciona)
-        enviar_whatsapp(numero, msg)
 
-        # Intentar enviar Excel como media
+        # Clasificar con reglas locales primero
+        clasificados = clasificar_con_reglas_locales(mov_banco)
+
+        # Calcular resumen
+        resumen = computar_resumen_wa(clasificados)
+
+        # Guardar sesión (TTL 24 h)
+        SESIONES[numero] = SesionExtracto(
+            mov_banco=mov_banco,
+            resumen=resumen,
+            clasificados=clasificados,
+        )
+        log.info(f"Sesión guardada para {numero} — {len(mov_banco)} movimientos")
+
+        # ── Respuesta principal al usuario ───────────────────────────────────
+        enviar_whatsapp(numero,
+            f"✅ *Extracto procesado*\n\n"
+            f"📊 Transacciones: {resumen['total_tx']}\n"
+            f"💚 Ingresos: {fmt_cop(resumen['ingresos'])}\n"
+            f"🔴 Egresos: {fmt_cop(resumen['egresos'])}\n"
+            f"💰 Saldo: {fmt_cop(resumen['saldo'])}\n\n"
+            f"Escribe *clasificar* para ver el top 10 con cuenta PUC\n"
+            f"Escribe *saldo* para ver el resumen en cualquier momento"
+        )
+
+        # ── Excel en background (puede fallar sin romper el flujo) ───────────
         try:
-            enviar_whatsapp_media(numero,
-                "Aqui tu Excel de conciliacion:", url_excel)
+            resultado_conc = conciliar(mov_banco)
+            excel_bytes = generar_excel_conciliacion(resultado_conc)
+            filename = f"Conciliacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            url_excel = subir_excel_twilio(excel_bytes, filename)
+            try:
+                enviar_whatsapp_media(numero, "📎 Aquí tu Excel de conciliación completo:", url_excel)
+            except Exception:
+                enviar_whatsapp(numero, f"📎 Descarga el Excel aquí:\n{url_excel}")
         except Exception as e:
-            log.error(f"Error enviando media: {e}")
-            # Si falla, enviar link directo
-            enviar_whatsapp(numero,
-                f"Descarga tu Excel aqui:\n{url_excel}")
+            log.warning(f"No se pudo generar Excel: {e}")
+
     except Exception as e:
-        log.error(f"Error: {e}", exc_info=True)
-        enviar_whatsapp(numero, "Ocurrio un error procesando el extracto. Intenta de nuevo.")
+        log.error(f"Error en procesar_extracto_pdf: {e}", exc_info=True)
+        enviar_whatsapp(numero, "❌ Ocurrió un error procesando el extracto. Intenta de nuevo.")
 
 def reporte_pagos_pendientes(numero: str):
     hoy = date.today()
@@ -841,6 +966,28 @@ def reporte_fiscal(numero: str):
     msg += "Recuerda verificar las fechas exactas segun tu NIT en el calendario DIAN."
     enviar_whatsapp(numero, msg)
 
-def responder_consulta_libre(numero: str, mensaje: str):
-    respuesta = consultar_agente(mensaje)
+def responder_consulta_libre(numero: str, mensaje: str, sesion: "SesionExtracto | None" = None):
+    contexto = ""
+    if sesion:
+        r = sesion.resumen
+        top5 = sesion.resumen["top10"][:5]
+        lineas_top = "\n".join(
+            f"  {m['fecha']} | {m['concepto'][:35]} | "
+            f"{fmt_cop(m['credito'] if m['credito'] > 0 else m['debito'])} | "
+            f"{'Abono' if m['credito'] > 0 else 'Cargo'} | PUC {m.get('cuenta_puc') or '—'}"
+            for m in top5
+        )
+        dist_lineas = "\n".join(
+            f"  PUC {cod} {v['nombre']}: {v['n']} mov · {fmt_cop(v['total'])}"
+            for cod, v in list(r["por_cuenta"].items())[:6]
+        )
+        contexto = (
+            f"EXTRACTO BANCARIO CARGADO ({r['total_tx']} transacciones):\n"
+            f"- Ingresos: {fmt_cop(r['ingresos'])}\n"
+            f"- Egresos:  {fmt_cop(r['egresos'])}\n"
+            f"- Saldo neto: {fmt_cop(r['saldo'])}\n\n"
+            f"TOP 5 POR VALOR:\n{lineas_top}\n\n"
+            f"DISTRIBUCIÓN PUC:\n{dist_lineas}"
+        )
+    respuesta = consultar_agente(mensaje, contexto)
     enviar_whatsapp(numero, respuesta)
