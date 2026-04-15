@@ -215,7 +215,7 @@ _RX_BANC_TX = re.compile(
     r"^(\d{1,2}/\d{2})"           # D/MM  (sin año)
     r"\s+(.+?)"                    # descripcion (lazy, cualquier texto)
     r"\s+(-?[\d,]*\.\d{2})"       # valor: -?miles.centavos  ej. -25,000.00 | 2.12 | .79
-    r"\s+([\d,]+\.\d{2})\s*$"     # saldo: siempre positivo  ej. 1,833,685.25
+    r"\s+([\d,]*\.\d{2})\s*$"     # saldo: positivo, parte entera opcional  ej. 1,833,685.25 | .93
 )
 _RX_DESDE = re.compile(r"DESDE:\s*(\d{4})/(\d{2})/\d{2}")
 
