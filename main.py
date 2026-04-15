@@ -14,7 +14,7 @@ from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
 from openpyxl.utils import get_column_letter
 
 from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import anthropic
 from twilio.rest import Client as TwilioClient
 
@@ -729,8 +729,20 @@ def subir_excel_twilio(excel_bytes: bytes, filename: str) -> str:
     path = f"/tmp/{filename}"
     with open(path, "wb") as f:
         f.write(excel_bytes)
-    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "http://localhost:8000")
-    return f"{base}/descargar/{filename}"
+    # Verificar que el archivo se escribió correctamente
+    size = os.path.getsize(path)
+    if size == 0:
+        raise RuntimeError(f"El archivo {filename} se escribió vacío en disco")
+    log.info(f"Excel guardado en disco: {path} — {size:,} bytes")
+    # RAILWAY_PUBLIC_DOMAIN no incluye protocolo; añadir https:// si falta
+    raw_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8000")
+    if raw_domain.startswith("http"):
+        base = raw_domain.rstrip("/")
+    else:
+        base = f"https://{raw_domain.rstrip('/')}"
+    url = f"{base}/descargar/{filename}"
+    log.info(f"URL de descarga generada: {url}")
+    return url
 
 @app.get("/")
 def root():
@@ -738,12 +750,21 @@ def root():
 
 @app.get("/descargar/{filename}")
 def descargar_archivo(filename: str):
-    from fastapi.responses import FileResponse
+    # Bloquear path traversal
+    if ".." in filename or "/" in filename:
+        raise HTTPException(400, "Nombre de archivo inválido")
     path = f"/tmp/{filename}"
     if not os.path.exists(path):
-        raise HTTPException(404, "Archivo no encontrado")
-    return FileResponse(path, filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        log.error(f"Archivo no encontrado en disco: {path}")
+        raise HTTPException(404, f"Archivo no encontrado: {filename}")
+    size = os.path.getsize(path)
+    log.info(f"Sirviendo archivo: {path} — {size:,} bytes")
+    return FileResponse(
+        path=path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.post("/procesar-pdf")
 async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
