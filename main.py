@@ -318,7 +318,7 @@ Devuelve ÚNICAMENTE un JSON válido con esta estructura, sin texto adicional ni
 Si un campo numérico no aplica usa 0. No incluyas texto fuera del JSON."""
 
     response = claude.messages.create(
-        model="claude-opus-4-5",
+        model="claude-haiku-4-5-20251001",
         max_tokens=8000,
         messages=[{
             "role": "user",
@@ -703,7 +703,7 @@ def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
     if contexto_extra:
         prompt = f"{contexto_extra}\n\nMensaje del usuario: {mensaje}"
     resp = claude.messages.create(
-        model="claude-opus-4-5",
+        model="claude-haiku-4-5-20251001",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}]
