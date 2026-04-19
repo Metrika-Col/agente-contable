@@ -427,8 +427,11 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin()
     ws1.row_dimensions[5].height = 28
+    max_desc_len = 10  # para auto-fit de la columna descripción
     for i, m in enumerate(clasificados, 6):
-        vals = [m["fecha"], m["concepto"], m["debito"] or None,
+        concepto = m["concepto"]
+        max_desc_len = max(max_desc_len, len(concepto))
+        vals = [m["fecha"], concepto, m["debito"] or None,
                 m["credito"] or None, m.get("saldo") or None,
                 m.get("cuenta_puc", ""), m.get("nombre_puc", "")]
         for j, v in enumerate(vals, 1):
@@ -436,10 +439,16 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
             cell.font   = font(size=9)
             cell.border = border_thin()
             cell.fill   = hdr_fill(VERDE_CLA) if i % 2 == 0 else hdr_fill("FFFFFF")
-            if j in (3, 4, 5) and v:
+            if j == 2:  # columna descripción: texto completo con wrap
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            elif j in (3, 4, 5) and v:
                 cell.number_format = "#,##0"
-                cell.alignment = Alignment(horizontal="right")
-    widths1 = [12, 40, 14, 14, 14, 12, 28]
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+        ws1.row_dimensions[i].height = max(30, min(60, 12 + (len(concepto) // 30) * 12))
+    # Ancho columna descripción: auto-fit basado en contenido (máx 80)
+    widths1 = [12, min(max_desc_len + 4, 80), 14, 14, 14, 12, 28]
     for j, w in enumerate(widths1, 1): fmt_col(ws1, j, w)
 
     # ── Hoja 2: Sin clasificar ────────────────────────────────────────────────
@@ -594,8 +603,12 @@ def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
     if contexto_extra:
         prompt += f"{contexto_extra}\n\n"
     prompt += f"Usuario: {mensaje}"
-    response = gemini.generate_content(prompt)
-    return response.text
+    try:
+        response = gemini.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        log.error(f"[consultar_agente] Gemini error — {type(e).__name__}: {e}", exc_info=True)
+        return f"❌ Error al consultar el asistente: {type(e).__name__}: {e}"
 
 def enviar_whatsapp(to: str, body: str):
     twilio.messages.create(
@@ -781,7 +794,12 @@ async def webhook_whatsapp(
             puc  = m.get("cuenta_puc") or "—"
             signo = "✅" if m["credito"] > 0 else "🔴"
             lineas.append(f"{signo} {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(abs(val))} | PUC {puc}")
-        msg = "📊 *Top 10 Transacciones con PUC*\n\n" + "\n".join(lineas)
+        explicacion = (
+            "ℹ️ El comando *clasificar* muestra las 10 transacciones de mayor valor "
+            "con su cuenta PUC asignada. Esto te ayuda a verificar la categorización "
+            "contable de tus movimientos bancarios.\n\n"
+        )
+        msg = explicacion + "📊 *Top 10 Transacciones con PUC*\n\n" + "\n".join(lineas)
         enviar_whatsapp(numero, msg)
         return {"status": "ok"}
 
