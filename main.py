@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 import pdfplumber
 import openpyxl
+import google.generativeai as genai
 from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
 from openpyxl.utils import get_column_letter
 
@@ -22,12 +23,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agente_contable")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WA_NUMBER   = os.getenv("TWILIO_WA_NUMBER", "whatsapp:+14155238886")
 
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio  = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini  = genai.GenerativeModel("gemini-1.5-flash")
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
@@ -586,16 +590,12 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
 # ─── Claude + Twilio ──────────────────────────────────────────────────────────
 
 def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
-    prompt = mensaje
+    prompt = f"{SYSTEM_PROMPT}\n\n"
     if contexto_extra:
-        prompt = f"{contexto_extra}\n\nMensaje del usuario: {mensaje}"
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return resp.content[0].text
+        prompt += f"{contexto_extra}\n\n"
+    prompt += f"Usuario: {mensaje}"
+    response = gemini.generate_content(prompt)
+    return response.text
 
 def enviar_whatsapp(to: str, body: str):
     twilio.messages.create(
