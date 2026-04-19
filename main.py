@@ -14,7 +14,7 @@ import google.generativeai as genai
 from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
 from openpyxl.utils import get_column_letter
 
-from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse, FileResponse
 import anthropic
 from twilio.rest import Client as TwilioClient
@@ -697,6 +697,54 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
 # ─── Webhook WhatsApp ─────────────────────────────────────────────────────────
 
 _MSG_SIN_PDF = "⚠️ Primero envíame el PDF de tu extracto bancario para comenzar."
+
+@app.post("/enviar-resumen-wa")
+async def enviar_resumen_wa(request: Request):
+    """Envía el resumen del reporte ejecutivo al número WhatsApp indicado."""
+    body = await request.json()
+    numero = str(body.get("numero", "")).replace("whatsapp:", "").strip()
+    if not numero:
+        raise HTTPException(400, "El campo 'numero' es requerido (ej. +573001234567)")
+
+    resumen  = body.get("resumen", {})
+    anomalias = body.get("anomalias")
+
+    total_ingresos = resumen.get("totalIngresos", 0)
+    total_egresos  = resumen.get("totalEgresos", 0)
+    balance        = resumen.get("balanceNeto", total_ingresos - total_egresos)
+    n_tx           = resumen.get("nTx", 0)
+    periodo        = resumen.get("periodo", "")
+    titular        = resumen.get("titular", "")
+
+    lineas_anomalias = ""
+    if anomalias:
+        total_a  = anomalias.get("total_alertas", 0)
+        criticas = anomalias.get("criticas", 0)
+        if total_a > 0:
+            lineas_anomalias = f"\n⚠️ {total_a} anomalía{'s' if total_a != 1 else ''} detectada{'s' if total_a != 1 else ''} ({criticas} crítica{'s' if criticas != 1 else ''})"
+        else:
+            lineas_anomalias = "\n✅ Sin anomalías detectadas"
+
+    msg = (
+        f"📊 *Reporte Ejecutivo CONTA*\n"
+        f"{f'Titular: {titular}' + chr(10) if titular else ''}"
+        f"Período: {periodo}\n\n"
+        f"💚 Ingresos: {fmt_cop(total_ingresos)}\n"
+        f"🔴 Egresos:  {fmt_cop(total_egresos)}\n"
+        f"📈 Balance:  {fmt_cop(balance)}\n"
+        f"📋 {n_tx} transacciones analizadas"
+        f"{lineas_anomalias}\n\n"
+        f"_Generado por CONTA · Metrika Group_"
+    )
+
+    try:
+        enviar_whatsapp(numero, msg)
+        log.info(f"Resumen WA enviado a {numero}")
+        return {"status": "ok", "mensaje": "Reporte enviado por WhatsApp"}
+    except Exception as e:
+        log.error(f"Error enviando resumen WA a {numero}: {e}")
+        raise HTTPException(500, f"Error al enviar WhatsApp: {str(e)}")
+
 
 @app.post("/webhook/whatsapp")
 async def webhook_whatsapp(
