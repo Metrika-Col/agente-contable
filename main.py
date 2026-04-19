@@ -31,7 +31,7 @@ TWILIO_WA_NUMBER   = os.getenv("TWILIO_WA_NUMBER", "whatsapp:+14155238886")
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio  = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini  = genai.GenerativeModel("gemini-1.5-flash")
+gemini  = genai.GenerativeModel("gemini-2.0-flash")
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
