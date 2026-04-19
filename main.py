@@ -2,15 +2,15 @@
 Agente Auxiliar Contable — Metrika Group
 FastAPI + Claude API + Twilio WhatsApp + openpyxl
 """
-import os, io, re, json, logging, tempfile
+import os, io, re, logging
+from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import Optional
 
 import httpx
 import pdfplumber
 import openpyxl
-from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
-                              numbers as xl_numbers)
+from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
 from openpyxl.utils import get_column_letter
 
 from fastapi import FastAPI, Form, BackgroundTasks, HTTPException, UploadFile, File
@@ -31,75 +31,18 @@ twilio  = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
-REGISTROS_CONTABLES = [
-    {"doc": "TRF-0012341", "fecha": "2025-01-02", "concepto": "Ingreso - PROVEEDORA TEXTIL S.A.",       "tipo": "CR", "valor": 5200000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "CHQ-0056782", "fecha": "2025-01-03", "concepto": "Gasto papeleria - SUMINISTROS LTDA",     "tipo": "DB", "valor": 380000,   "cuenta": "5105", "conciliado": False},
-    {"doc": "PSE-0098431", "fecha": "2025-01-05", "concepto": "Seguro - BOLIVAR S.A.",                  "tipo": "DB", "valor": 1250000,  "cuenta": "5135", "conciliado": False},
-    {"doc": "TRF-0012398", "fecha": "2025-01-07", "concepto": "Ingreso - CLIENTE OMEGA SAS",            "tipo": "CR", "valor": 3800000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "DEB-0034521", "fecha": "2025-01-09", "concepto": "Energia electrica - ENDESA",             "tipo": "DB", "valor": 890000,   "cuenta": "5115", "conciliado": False},
-    {"doc": "TRF-0012501", "fecha": "2025-01-12", "concepto": "Ingreso - ALMACEN EL EXITO SA",          "tipo": "CR", "valor": 2100000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "CHQ-0056830", "fecha": "2025-01-14", "concepto": "Pago proveedor - CENTRAL LTDA",          "tipo": "DB", "valor": 1500000,  "cuenta": "2205", "conciliado": False},
-    {"doc": "PSE-0098512", "fecha": "2025-01-15", "concepto": "Telefonia - ETB S.A.",                   "tipo": "DB", "valor": 245000,   "cuenta": "5120", "conciliado": False},
-    {"doc": "TRF-0012560", "fecha": "2025-01-17", "concepto": "Ingreso - COMERCIAL LOS ANDES",          "tipo": "CR", "valor": 4500000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "DEB-0034678", "fecha": "2025-01-19", "concepto": "Leasing vehiculo - BANCOLOMBIA",         "tipo": "DB", "valor": 1800000,  "cuenta": "5210", "conciliado": False},
-    {"doc": "TRF-0012621", "fecha": "2025-01-21", "concepto": "Pago proveedor - MAPLOCA S.A.",          "tipo": "DB", "valor": 2300000,  "cuenta": "2205", "conciliado": False},
-    {"doc": "TRF-0012655", "fecha": "2025-01-22", "concepto": "Ingreso - GRUPO EMPRESARIAL XYZ",        "tipo": "CR", "valor": 5000000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "CHQ-0056891", "fecha": "2025-01-24", "concepto": "Ferreteria - EL MARTILLO",               "tipo": "DB", "valor": 420000,   "cuenta": "5105", "conciliado": False},
-    {"doc": "TRF-0012700", "fecha": "2025-01-24", "concepto": "Cobro comision servicio - sin banco",    "tipo": "CR", "valor": 950000,   "cuenta": "1305", "conciliado": False},
-    {"doc": "PSE-0098601", "fecha": "2025-01-25", "concepto": "Acueducto - TRIPLE A",                   "tipo": "DB", "valor": 185000,   "cuenta": "5115", "conciliado": False},
-    {"doc": "TRF-0012710", "fecha": "2025-01-27", "concepto": "ICA enero - Distrito Barranquilla",      "tipo": "DB", "valor": 620000,   "cuenta": "2404", "conciliado": False},
-    {"doc": "TRF-0012745", "fecha": "2025-01-28", "concepto": "Ingreso - CLIENTE BETA LTDA",            "tipo": "CR", "valor": 1800000,  "cuenta": "1305", "conciliado": False},
-    {"doc": "TRF-0012790", "fecha": "2025-01-30", "concepto": "Devolucion IVA - DIAN",                  "tipo": "CR", "valor": 800000,   "cuenta": "2408", "conciliado": False},
-    {"doc": "TRF-0012801", "fecha": "2025-01-31", "concepto": "Retencion fuente - DIAN ene/2025",       "tipo": "DB", "valor": 3000000,  "cuenta": "2365", "conciliado": False},
-]
-
-PAGOS_PENDIENTES = [
-    {"proveedor": "INDUSTRIAS MAPLOCA S.A.",    "concepto": "Factura 2024-892 - Materia prima",   "valor": 3800000,  "vencimiento": "2025-02-05", "estado": "VENCIDO"},
-    {"proveedor": "PAPELERIA UNIVERSAL LTDA",   "concepto": "Factura 2025-011 - Suministros",      "valor": 450000,   "vencimiento": "2025-02-10", "estado": "PROXIMO"},
-    {"proveedor": "LEASING BANCOLOMBIA",        "concepto": "Cuota febrero - Leasing vehiculo",    "valor": 1800000,  "vencimiento": "2025-02-19", "estado": "PENDIENTE"},
-    {"proveedor": "SEGUROS BOLIVAR S.A.",       "concepto": "Prima trimestral seguro todo riesgo", "valor": 1250000,  "vencimiento": "2025-02-28", "estado": "PENDIENTE"},
-    {"proveedor": "DISTRIBUIDORA CENTRAL LTDA", "concepto": "Factura 2024-445 - Mercancia",        "valor": 2100000,  "vencimiento": "2025-01-31", "estado": "VENCIDO"},
-]
-
-OBLIGACIONES_FISCALES = [
-    {"obligacion": "Retencion en la fuente",  "periodo": "Enero 2025",  "vencimiento": "2025-02-17", "estado": "PENDIENTE", "valor_aprox": 3000000},
-    {"obligacion": "IVA bimestral",           "periodo": "Nov-Dic 2024","vencimiento": "2025-02-12", "estado": "PENDIENTE", "valor_aprox": 2800000},
-    {"obligacion": "ICA Barranquilla",        "periodo": "Enero 2025",  "vencimiento": "2025-02-20", "estado": "PENDIENTE", "valor_aprox": 620000},
-]
-
-SYSTEM_PROMPT = """Eres CONTA, el Auxiliar Contable Inteligente de Distribuidora El Progreso S.A.S., desarrollado por Metrika Group.
-
-Tu función es asistir al contador y al equipo administrativo en las tareas contables del día a día.
-
-CONOCIMIENTO CONTABLE:
-- Manejas el Plan Único de Cuentas (PUC) colombiano
-- Conoces las obligaciones tributarias: IVA, Retención en la Fuente, ICA, Renta
-- Entiendes conciliación bancaria: cruzar extracto bancario vs. registros contables
-- Identificas partidas conciliadas (match exacto doc+valor) y partidas abiertas (diferencias)
-- Conoces los plazos de la DIAN y los calendarios tributarios colombianos
-
-EMPRESA:
-- Nombre: Distribuidora El Progreso S.A.S.
-- NIT: 901.234.567-1
-- Ciudad: Barranquilla, Colombia
-- Banco principal: Bancolombia - Cta. Cte. 63-000123456-78
-- Régimen: Responsable de IVA, Gran contribuyente retención
-
-TONO:
-- Profesional pero cercano
-- Respuestas concisas por WhatsApp (máximo 3-4 párrafos)
-- Usa emojis contables con moderación: ✅ ❌ ⚠️ 📊 💰
-- Cuando generes un Excel, avisa que lo estás preparando"""
+SYSTEM_PROMPT = """Eres CONTA, auxiliar contable de Metrika Group.
+Respondes en español, eres preciso y conciso."""
 
 # ─── Sesiones por número de teléfono (TTL 24 h) ──────────────────────────────
 from dataclasses import dataclass, field as dc_field
 
 @dataclass
 class SesionExtracto:
-    mov_banco:   list[dict]
-    resumen:     dict          # totales pre-calculados
-    clasificados: list[dict]   # mov_banco con cuenta_puc asignada
-    timestamp:   datetime = dc_field(default_factory=datetime.now)
+    mov_banco:    list[dict]
+    resumen:      dict
+    clasificados: list[dict]
+    timestamp:    datetime = dc_field(default_factory=datetime.now)
 
 SESIONES: dict[str, SesionExtracto] = {}
 SESION_TTL_HORAS = 24
@@ -114,7 +57,6 @@ def limpiar_sesiones_expiradas():
 
 # ─── Reglas locales de clasificación PUC ─────────────────────────────────────
 REGLAS_PUC_LOCAL = [
-    # Clave: lista de substrings en descripción (lowercase) → (código PUC, nombre)
     (["intereses ahorros", "abono intereses", "intereses"],  "1110", "Bancos"),
     (["nequi", "transferencia nequi"],                        "1305", "Clientes"),
     (["nomina", "nomi ", "salario", "empleado"],              "5105", "Gastos de personal"),
@@ -135,7 +77,6 @@ REGLAS_PUC_LOCAL = [
 ]
 
 def clasificar_con_reglas_locales(mov_banco: list[dict]) -> list[dict]:
-    """Añade cuenta_puc a cada movimiento usando reglas keyword → PUC."""
     resultado = []
     for m in mov_banco:
         desc = m.get("concepto", "").lower()
@@ -148,11 +89,9 @@ def clasificar_con_reglas_locales(mov_banco: list[dict]) -> list[dict]:
     return resultado
 
 def computar_resumen_wa(mov_banco: list[dict]) -> dict:
-    """Calcula totales y top 10 para la sesión y mensajes de WhatsApp."""
     ingresos = sum(m["credito"] for m in mov_banco)
     egresos  = sum(m["debito"]  for m in mov_banco)
     top10 = sorted(mov_banco, key=lambda m: m["credito"] + m["debito"], reverse=True)[:10]
-    # Distribución por cuenta PUC (requiere clasificacion previa)
     dist: dict[str, dict] = {}
     for m in mov_banco:
         cod = m.get("cuenta_puc") or "Sin clasificar"
@@ -162,21 +101,22 @@ def computar_resumen_wa(mov_banco: list[dict]) -> dict:
         dist[cod]["n"] += 1
         dist[cod]["total"] += m["credito"] + m["debito"]
     return {
-        "total_tx": len(mov_banco),
-        "ingresos": ingresos,
-        "egresos":  egresos,
-        "saldo":    ingresos - egresos,
-        "top10":    top10,
+        "total_tx":   len(mov_banco),
+        "ingresos":   ingresos,
+        "egresos":    egresos,
+        "saldo":      ingresos - egresos,
+        "top10":      top10,
         "por_cuenta": dist,
     }
 
 def fmt_cop(n: float) -> str:
     return f"${n:,.0f}".replace(",", ".")
 
+# ─── Parsers de extracto Bancolombia ─────────────────────────────────────────
+
 async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
     log.info(f"Iniciando parser — PDF recibido: {len(pdf_bytes):,} bytes")
 
-    # NIVEL 1: texto plano + regex — formato real Bancolombia Ahorros (D/MM valor saldo)
     log.info("Parser nivel 1: texto plano + regex Bancolombia ahorros...")
     try:
         movimientos = _parsear_bancolombia_ahorros(pdf_bytes)
@@ -187,7 +127,6 @@ async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
     except Exception as e:
         log.error(f"Parser nivel 1 FALLÓ — {type(e).__name__}: {e}", exc_info=True)
 
-    # NIVEL 2: tablas pdfplumber — PDFs estructurados con fecha DD/MM/YYYY completa
     log.info("Parser nivel 2: pdfplumber tablas (fecha completa)...")
     try:
         movimientos = _parsear_con_tablas(pdf_bytes)
@@ -202,42 +141,22 @@ async def parsear_extracto_bancolombia(pdf_bytes: bytes) -> list[dict]:
     return []
 
 
-# ── Regex para líneas de transacción Bancolombia Ahorros ────────────────────
-# Formato extraído por pdfplumber (columnas SUCURSAL y DCTO. ausentes en texto):
-#   D/MM   DESCRIPCION                      VALOR         SALDO
-#   1/01   ABONO INTERESES AHORROS          2.12          1,833,685.25
-#   2/01   TRANSFERENCIAS A NEQUI           -25,000.00    1,528,686.04
-#   15/01  PAGO DE NOMI HADA INTERNATIO     2,354,481.00  2,392,605.26
-#
-# Números: coma = miles, punto = decimal  (e.g. 1,833,685.25 = 1.833.685,25 COP)
-# Valor negativo = cargo (débito); positivo = abono (crédito)
+# Formato Bancolombia Ahorros: D/MM  DESCRIPCION  VALOR  SALDO
 _RX_BANC_TX = re.compile(
-    r"^(\d{1,2}/\d{2})"           # D/MM  (sin año)
-    r"\s+(.+?)"                    # descripcion (lazy, cualquier texto)
-    r"\s+(-?[\d,]*\.\d{2})"       # valor: -?miles.centavos  ej. -25,000.00 | 2.12 | .79
-    r"\s+([\d,]*\.\d{2})\s*$"     # saldo: positivo, parte entera opcional  ej. 1,833,685.25 | .93
+    r"^(\d{1,2}/\d{2})"
+    r"\s+(.+?)"
+    r"\s+(-?[\d,]*\.\d{2})"
+    r"\s+([\d,]*\.\d{2})\s*$"
 )
 _RX_DESDE = re.compile(r"DESDE:\s*(\d{4})/(\d{2})/\d{2}")
 
 
 def _parsear_bancolombia_ahorros(pdf_bytes: bytes) -> list[dict]:
-    """
-    Parser nivel 1 — Bancolombia Cuenta de Ahorros (Estado de Cuenta).
-
-    pdfplumber omite columnas SUCURSAL y DCTO. cuando están vacías,
-    dejando solo: D/MM  DESCRIPCION  VALOR  SALDO
-
-    Inferencia de año:
-      - Se lee 'DESDE: YYYY/MM/DD' del encabezado para obtener año y mes de inicio.
-      - Se incrementa el año cuando el mes de una transacción es menor al mes anterior
-        (rollover de año, ej. diciembre → enero).
-    """
     movimientos: list[dict] = []
     desde_year  = datetime.now().year
     desde_month = 1
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # Paso 1: recopilar texto de todas las páginas
         pages_text: list[str] = []
         all_text = ""
         for page in pdf.pages:
@@ -245,13 +164,11 @@ def _parsear_bancolombia_ahorros(pdf_bytes: bytes) -> list[dict]:
             pages_text.append(t)
             all_text += t + "\n"
 
-        # Paso 2: extraer año y mes de inicio del encabezado
         m = _RX_DESDE.search(all_text)
         if m:
             desde_year  = int(m.group(1))
             desde_month = int(m.group(2))
 
-        # Paso 3: parsear transacciones con detección de rollover de año
         current_year = desde_year
         prev_month   = desde_month
 
@@ -267,7 +184,6 @@ def _parsear_bancolombia_ahorros(pdf_bytes: bytes) -> list[dict]:
                 tx_month = int(month_s)
                 tx_day   = int(day_s)
 
-                # Rollover de año: si el mes retrocede (ej. 12 → 1)
                 if tx_month < prev_month:
                     current_year += 1
                 prev_month = tx_month
@@ -293,11 +209,6 @@ def _parsear_bancolombia_ahorros(pdf_bytes: bytes) -> list[dict]:
 
 
 def _parsear_con_tablas(pdf_bytes: bytes) -> list[dict]:
-    """
-    Parser nivel 2 — PDFs estructurados con tabla y fecha completa DD/MM/YYYY.
-    Fallback para extractos de Cuenta Corriente o formatos con DCTO. explícito.
-    Números en formato colombiano: punto = miles, coma = decimal.
-    """
     movimientos: list[dict] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -324,10 +235,6 @@ def _parsear_con_tablas(pdf_bytes: bytes) -> list[dict]:
 
 
 def _parse_valor_banc(s: str) -> float:
-    """
-    Formato Bancolombia Ahorros: coma=miles, punto=decimal.
-    Ejemplos: '1,833,685.25' → 1833685.25 | '-25,000.00' → -25000.0 | '.79' → 0.79
-    """
     s = s.strip().replace("$", "").replace(",", "").replace(" ", "")
     try:
         return float(s)
@@ -336,104 +243,127 @@ def _parse_valor_banc(s: str) -> float:
 
 
 def _parse_valor_co(s: str) -> float:
-    """
-    Formato colombiano: punto=miles, coma=decimal.
-    Ejemplos: '5.200.000' → 5200000.0 | '1.234,56' → 1234.56
-    """
     s = s.strip().replace("$", "").replace(".", "").replace(",", ".").replace(" ", "")
     try:
         return float(s)
     except Exception:
         return 0.0
 
+# ─── Conciliación: solo datos reales del banco ───────────────────────────────
+
 def conciliar(mov_banco: list[dict]) -> dict:
-    registros = [r.copy() for r in REGISTROS_CONTABLES]
-    conciliados = []
-    solo_banco  = []
-    solo_conta  = []
+    """
+    Clasifica y agrupa los movimientos reales del banco por cuenta PUC.
+    Sin registros contables propios del usuario: no hay cruce inventado.
+    Para conciliación completa, el usuario debe importar sus registros de OSSADO.
+    """
+    if mov_banco and "cuenta_puc" not in mov_banco[0]:
+        mov_banco = clasificar_con_reglas_locales(mov_banco)
 
-    for mb in mov_banco:
-        match = None
-        mb_valor = mb["debito"] or mb["credito"]
+    clasificados   = [m for m in mov_banco if m.get("cuenta_puc")]
+    sin_clasificar = [m for m in mov_banco if not m.get("cuenta_puc")]
 
-        # Intento 1: match por número de documento
-        if mb["doc"]:
-            for rc in registros:
-                if rc["conciliado"]:
-                    continue
-                if mb["doc"] == rc["doc"]:
-                    match = rc
-                    break
+    top_egresos = sorted(
+        [m for m in mov_banco if m["debito"] > 0],
+        key=lambda m: m["debito"],
+        reverse=True
+    )[:20]
 
-        # Intento 2 (doc vacío): match por valor + fecha (±1 día de tolerancia)
-        if match is None:
-            mb_fecha = datetime.strptime(mb["fecha"], "%Y-%m-%d").date()
-            for rc in registros:
-                if rc["conciliado"]:
-                    continue
-                rc_fecha = datetime.strptime(rc["fecha"], "%Y-%m-%d").date()
-                fecha_ok = abs((mb_fecha - rc_fecha).days) <= 1
-                valor_ok = mb_valor and abs(mb_valor - rc["valor"]) < 1
-                if fecha_ok and valor_ok:
-                    match = rc
-                    break
-
-        if match:
-            match["conciliado"] = True
-            conciliados.append({
-                "fecha_banco": mb["fecha"],
-                "fecha_conta": match["fecha"],
-                "doc": mb["doc"],
-                "concepto_banco": mb["concepto"],
-                "concepto_conta": match["concepto"],
-                "valor": mb["debito"] or mb["credito"],
-                "tipo": "DB" if mb["debito"] > 0 else "CR",
-                "cuenta_puc": match["cuenta"],
-                "estado": "CONCILIADO",
-            })
-        else:
-            solo_banco.append({
-                "fecha": mb["fecha"],
-                "doc": mb["doc"],
-                "concepto": mb["concepto"],
-                "valor": mb["debito"] or mb["credito"],
-                "tipo": "DB" if mb["debito"] > 0 else "CR",
-                "estado": "SOLO EN BANCO",
-            })
-
-    for rc in registros:
-        if not rc["conciliado"]:
-            solo_conta.append({
-                "fecha": rc["fecha"],
-                "doc": rc["doc"],
-                "concepto": rc["concepto"],
-                "valor": rc["valor"],
-                "tipo": rc["tipo"],
-                "cuenta_puc": rc["cuenta"],
-                "estado": "SOLO EN CONTABILIDAD",
-            })
-
-    total_banco_db = sum(m["debito"]  for m in mov_banco)
-    total_banco_cr = sum(m["credito"] for m in mov_banco)
-    total_conta_db = sum(r["valor"] for r in REGISTROS_CONTABLES if r["tipo"] == "DB")
-    total_conta_cr = sum(r["valor"] for r in REGISTROS_CONTABLES if r["tipo"] == "CR")
+    total_db = sum(m["debito"]  for m in mov_banco)
+    total_cr = sum(m["credito"] for m in mov_banco)
 
     return {
-        "conciliados": conciliados,
-        "solo_banco":  solo_banco,
-        "solo_conta":  solo_conta,
+        "mov_banco":      mov_banco,
+        "clasificados":   clasificados,
+        "sin_clasificar": sin_clasificar,
+        "top_egresos":    top_egresos,
+        # Claves de compatibilidad con la interfaz web
+        "conciliados": clasificados,
+        "solo_banco":  sin_clasificar,
+        "solo_conta":  [],
         "resumen": {
-            "total_conciliados":   len(conciliados),
-            "total_solo_banco":    len(solo_banco),
-            "total_solo_conta":    len(solo_conta),
-            "debitos_banco":       total_banco_db,
-            "creditos_banco":      total_banco_cr,
-            "debitos_conta":       total_conta_db,
-            "creditos_conta":      total_conta_cr,
-            "diferencia_debitos":  total_banco_db - total_conta_db,
-            "diferencia_creditos": total_banco_cr - total_conta_cr,
-        }
+            "total_tx":             len(mov_banco),
+            "total_clasificados":   len(clasificados),
+            "total_sin_clasificar": len(sin_clasificar),
+            "debitos_banco":        total_db,
+            "creditos_banco":       total_cr,
+            "saldo_neto":           total_cr - total_db,
+            # Legacy keys
+            "total_conciliados":    len(clasificados),
+            "total_solo_banco":     len(sin_clasificar),
+            "total_solo_conta":     0,
+            "diferencia_debitos":   0,
+            "diferencia_creditos":  0,
+        },
+        "nota": "Para conciliación completa necesitas importar tus registros contables de OSSADO.",
     }
+
+# ─── Calendario DIAN real (calculado dinámicamente) ──────────────────────────
+
+_MESES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+          "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+def _calendario_dian_proximas() -> list[dict]:
+    """Próximas obligaciones DIAN colombianas calculadas desde date.today()."""
+    hoy = date.today()
+    obligaciones: list[dict] = []
+
+    # Retención en la fuente: mensual, vence día 12 del mes siguiente
+    for delta in range(4):
+        mes_venc = hoy.month + delta
+        anio_venc = hoy.year + (mes_venc - 1) // 12
+        mes_venc  = ((mes_venc - 1) % 12) + 1
+        try:
+            venc = date(anio_venc, mes_venc, 12)
+        except ValueError:
+            continue
+        if venc < hoy:
+            continue
+        mes_per  = (mes_venc - 2) % 12 + 1
+        anio_per = anio_venc if mes_venc > 1 else anio_venc - 1
+        obligaciones.append({
+            "obligacion": "Retención en la fuente",
+            "periodo":    f"{_MESES[mes_per]} {anio_per}",
+            "vencimiento": str(venc),
+        })
+
+    # IVA bimestral: vence día 12 del mes siguiente al bimestre
+    # Bimestres: (mes_inicio, mes_fin, mes_vencimiento)
+    for m1, m2, m_venc in [(1,2,3),(3,4,5),(5,6,7),(7,8,9),(9,10,11),(11,12,1)]:
+        anio_venc = hoy.year + (1 if m_venc < m1 else 0)
+        try:
+            venc = date(anio_venc, m_venc, 12)
+        except ValueError:
+            continue
+        if venc < hoy:
+            continue
+        anio_per = anio_venc - (1 if m_venc < m1 else 0)
+        obligaciones.append({
+            "obligacion": "IVA bimestral",
+            "periodo":    f"{_MESES[m1]}-{_MESES[m2]} {anio_per}",
+            "vencimiento": str(venc),
+        })
+
+    # ICA Barranquilla: trimestral, vence día 20 del mes siguiente
+    for m_ini, m_fin, m_venc in [(1,3,4),(4,6,7),(7,9,10),(10,12,1)]:
+        anio_venc = hoy.year + (1 if m_venc < m_ini else 0)
+        try:
+            venc = date(anio_venc, m_venc, 20)
+        except ValueError:
+            continue
+        if venc < hoy:
+            continue
+        anio_per = anio_venc - (1 if m_venc < m_ini else 0)
+        obligaciones.append({
+            "obligacion": "ICA Barranquilla",
+            "periodo":    f"T {_MESES[m_ini]}-{_MESES[m_fin]} {anio_per}",
+            "vencimiento": str(venc),
+        })
+
+    obligaciones.sort(key=lambda o: o["vencimiento"])
+    return obligaciones[:7]
+
+# ─── Generación Excel ─────────────────────────────────────────────────────────
 
 def generar_excel_conciliacion(resultado: dict) -> bytes:
     wb = openpyxl.Workbook()
@@ -458,7 +388,7 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
 
     def escribir_encabezado(ws, titulo, subtitulo):
         ws.merge_cells("A1:H1")
-        ws["A1"] = "DISTRIBUIDORA EL PROGRESO S.A.S."
+        ws["A1"] = "EXTRACTO BANCOLOMBIA — ANÁLISIS CONTABLE"
         ws["A1"].font = Font(bold=True, size=14, color="FFFFFF", name="Calibri")
         ws["A1"].fill = hdr_fill(NEGRO)
         ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
@@ -474,13 +404,18 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         ws["A3"].font = Font(size=9, color="555555", name="Calibri")
         ws["A3"].alignment = Alignment(horizontal="center")
 
-    # Hoja 1 - Conciliados
+    mov_banco    = resultado.get("mov_banco", [])
+    clasificados = resultado.get("clasificados", [])
+    sin_clasi    = resultado.get("sin_clasificar", [])
+    top_egresos  = resultado.get("top_egresos", [])
+    res          = resultado["resumen"]
+
+    # ── Hoja 1: Movimientos clasificados ─────────────────────────────────────
     ws1 = wb.active
-    ws1.title = "Conciliados"
-    escribir_encabezado(ws1, "CONCILIACION BANCARIA ENERO 2025",
-                        f"Movimientos conciliados | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    cols1 = ["Fecha Banco","Fecha Conta","No. Documento","Concepto Banco",
-             "Concepto Contabilidad","Valor ($)","Tipo","Cuenta PUC"]
+    ws1.title = "Movimientos"
+    escribir_encabezado(ws1, "MOVIMIENTOS CLASIFICADOS POR PUC",
+                        f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    cols1 = ["Fecha", "Concepto", "Débito ($)", "Crédito ($)", "Saldo ($)", "Cuenta PUC", "Nombre PUC"]
     for j, c in enumerate(cols1, 1):
         cell = ws1.cell(row=5, column=j, value=c)
         cell.font  = Font(bold=True, color="FFFFFF", size=9, name="Calibri")
@@ -488,176 +423,149 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin()
     ws1.row_dimensions[5].height = 28
-    for i, row in enumerate(resultado["conciliados"], 6):
-        vals = [row["fecha_banco"], row["fecha_conta"], row["doc"],
-                row["concepto_banco"], row["concepto_conta"],
-                row["valor"], row["tipo"], row["cuenta_puc"]]
+    for i, m in enumerate(clasificados, 6):
+        vals = [m["fecha"], m["concepto"], m["debito"] or None,
+                m["credito"] or None, m.get("saldo") or None,
+                m.get("cuenta_puc", ""), m.get("nombre_puc", "")]
         for j, v in enumerate(vals, 1):
             cell = ws1.cell(row=i, column=j, value=v)
             cell.font   = font(size=9)
             cell.border = border_thin()
             cell.fill   = hdr_fill(VERDE_CLA) if i % 2 == 0 else hdr_fill("FFFFFF")
-            if j == 6:
+            if j in (3, 4, 5) and v:
                 cell.number_format = "#,##0"
                 cell.alignment = Alignment(horizontal="right")
-            elif j in (1,2,3,7,8):
-                cell.alignment = Alignment(horizontal="center")
-    widths1 = [13,13,15,35,35,14,7,12]
+    widths1 = [12, 40, 14, 14, 14, 12, 28]
     for j, w in enumerate(widths1, 1): fmt_col(ws1, j, w)
-    last1 = 5 + len(resultado["conciliados"])
-    ws1.cell(row=last1+1, column=5, value="TOTAL CONCILIADO:").font = font(bold=True)
-    tc = ws1.cell(row=last1+1, column=6, value=sum(r["valor"] for r in resultado["conciliados"]))
-    tc.font = Font(bold=True, size=10, color=VERDE_OSC, name="Calibri")
-    tc.number_format = "#,##0"
-    tc.alignment = Alignment(horizontal="right")
 
-    # Hoja 2 - Partidas Abiertas
-    ws2 = wb.create_sheet("Partidas Abiertas")
-    escribir_encabezado(ws2, "PARTIDAS ABIERTAS - DIFERENCIAS",
-                        "Movimientos sin match entre banco y contabilidad")
-    ws2.cell(row=5, column=1, value="SOLO EN EXTRACTO BANCARIO").font = Font(bold=True, color=ROJO_OSC, size=10, name="Calibri")
-    ws2.merge_cells("A5:G5")
-    cols2 = ["Fecha","No. Documento","Concepto","Valor ($)","Tipo","Estado","Accion Requerida"]
+    # ── Hoja 2: Sin clasificar ────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Sin Clasificar")
+    escribir_encabezado(ws2, "MOVIMIENTOS SIN CUENTA PUC",
+                        "Requieren revisión manual — asignar cuenta contable")
+    ws2.merge_cells("A4:G4")
+    nota = ws2.cell(row=4, column=1,
+        value="⚠️  Para conciliación completa, importar registros contables de OSSADO")
+    nota.font = Font(bold=True, color=ROJO_OSC, size=10, name="Calibri")
+    nota.alignment = Alignment(horizontal="center")
+    cols2 = ["Fecha", "Concepto", "Débito ($)", "Crédito ($)", "Saldo ($)", "Tipo", "Acción"]
     for j, c in enumerate(cols2, 1):
-        cell = ws2.cell(row=6, column=j, value=c)
+        cell = ws2.cell(row=5, column=j, value=c)
         cell.font = Font(bold=True, color="FFFFFF", size=9, name="Calibri")
         cell.fill = hdr_fill(ROJO_OSC)
         cell.alignment = Alignment(horizontal="center")
         cell.border = border_thin()
-    r = 7
-    for row in resultado["solo_banco"]:
-        datos = [row["fecha"], row["doc"], row["concepto"],
-                 row["valor"], row["tipo"], row["estado"], "Registrar en contabilidad"]
-        for j, v in enumerate(datos, 1):
-            cell = ws2.cell(row=r, column=j, value=v)
-            cell.font = font(size=9)
-            cell.border = border_thin()
-            cell.fill = hdr_fill(ROJO_CLA)
-            if j == 4:
-                cell.number_format = "#,##0"
-                cell.alignment = Alignment(horizontal="right")
-        r += 1
-    r += 1
-    ws2.cell(row=r, column=1, value="SOLO EN CONTABILIDAD (NO EN BANCO)").font = Font(bold=True, color=AZUL_OSC, size=10, name="Calibri")
-    ws2.merge_cells(f"A{r}:G{r}")
-    r += 1
-    cols2b = ["Fecha","No. Documento","Concepto","Valor ($)","Tipo","Cuenta PUC","Estado"]
-    for j, c in enumerate(cols2b, 1):
-        cell = ws2.cell(row=r, column=j, value=c)
-        cell.font = Font(bold=True, color="FFFFFF", size=9, name="Calibri")
-        cell.fill = hdr_fill(AZUL_OSC)
-        cell.alignment = Alignment(horizontal="center")
-        cell.border = border_thin()
-    r += 1
-    for row in resultado["solo_conta"]:
-        datos = [row["fecha"], row["doc"], row["concepto"],
-                 row["valor"], row["tipo"], row.get("cuenta_puc",""), row["estado"]]
-        for j, v in enumerate(datos, 1):
-            cell = ws2.cell(row=r, column=j, value=v)
+    for i, m in enumerate(sin_clasi, 6):
+        tipo = "Crédito" if m["credito"] > 0 else "Débito"
+        vals = [m["fecha"], m["concepto"], m["debito"] or None,
+                m["credito"] or None, m.get("saldo") or None,
+                tipo, "Asignar cuenta PUC manualmente"]
+        for j, v in enumerate(vals, 1):
+            cell = ws2.cell(row=i, column=j, value=v)
             cell.font = font(size=9)
             cell.border = border_thin()
             cell.fill = hdr_fill(AMARILLO_CL)
-            if j == 4:
+            if j in (3, 4, 5) and v:
                 cell.number_format = "#,##0"
                 cell.alignment = Alignment(horizontal="right")
-        r += 1
-    widths2 = [13,15,40,14,7,12,30]
+    widths2 = [12, 40, 14, 14, 14, 10, 35]
     for j, w in enumerate(widths2, 1): fmt_col(ws2, j, w)
 
-    # Hoja 3 - Pagos Pendientes
-    ws3 = wb.create_sheet("Pagos Pendientes")
-    escribir_encabezado(ws3, "CONTROL DE PAGOS PENDIENTES",
-                        f"Corte: {datetime.now().strftime('%d/%m/%Y')}")
-    cols3 = ["Proveedor","Concepto","Valor ($)","Fecha Vencimiento","Dias","Estado","Prioridad"]
+    # ── Hoja 3: Top Egresos ───────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Top Egresos")
+    escribir_encabezado(ws3, "TOP EGRESOS DEL PERÍODO",
+                        f"Corte: {date.today().strftime('%d/%m/%Y')}")
+    cols3 = ["Fecha", "Concepto", "Débito ($)", "Cuenta PUC", "Nombre PUC"]
     for j, c in enumerate(cols3, 1):
         cell = ws3.cell(row=5, column=j, value=c)
         cell.font = Font(bold=True, color="FFFFFF", size=9, name="Calibri")
         cell.fill = hdr_fill(NEGRO)
         cell.alignment = Alignment(horizontal="center")
         cell.border = border_thin()
-    hoy = date.today()
-    for i, pago in enumerate(PAGOS_PENDIENTES, 6):
-        venc = datetime.strptime(pago["vencimiento"], "%Y-%m-%d").date()
-        dias = (venc - hoy).days
-        prioridad = "URGENTE" if dias < 0 else ("ESTA SEMANA" if dias <= 7 else "PROXIMO")
-        color_fila = ROJO_CLA if dias < 0 else (AMARILLO_CL if dias <= 7 else VERDE_CLA)
-        datos = [pago["proveedor"], pago["concepto"], pago["valor"],
-                 pago["vencimiento"], dias, pago["estado"], prioridad]
-        for j, v in enumerate(datos, 1):
+    for i, m in enumerate(top_egresos, 6):
+        vals = [m["fecha"], m["concepto"], m["debito"],
+                m.get("cuenta_puc", "—"), m.get("nombre_puc", "Sin clasificar")]
+        for j, v in enumerate(vals, 1):
             cell = ws3.cell(row=i, column=j, value=v)
             cell.font = font(size=9)
             cell.border = border_thin()
-            cell.fill = hdr_fill(color_fila)
+            cell.fill = hdr_fill(ROJO_CLA) if i % 2 == 0 else hdr_fill("FFFFFF")
             if j == 3:
                 cell.number_format = "#,##0"
                 cell.alignment = Alignment(horizontal="right")
-    widths3 = [28,35,14,18,8,12,14]
+    widths3 = [12, 45, 14, 12, 28]
     for j, w in enumerate(widths3, 1): fmt_col(ws3, j, w)
-    last3 = 5 + len(PAGOS_PENDIENTES)
-    ws3.cell(row=last3+1, column=2, value="TOTAL POR PAGAR:").font = font(bold=True)
-    tc3 = ws3.cell(row=last3+1, column=3, value=sum(p["valor"] for p in PAGOS_PENDIENTES))
+    last3 = 5 + len(top_egresos)
+    ws3.cell(row=last3+1, column=2, value="TOTAL EGRESOS:").font = font(bold=True)
+    tc3 = ws3.cell(row=last3+1, column=3, value=res["debitos_banco"])
     tc3.number_format = "#,##0"
-    tc3.font = Font(bold=True, color=ROJO_OSC, size=11, name="Calibri")
+    tc3.font = Font(bold=True, size=10, color=ROJO_OSC, name="Calibri")
     tc3.alignment = Alignment(horizontal="right")
 
-    # Hoja 4 - Obligaciones Fiscales
-    ws4 = wb.create_sheet("Obligaciones Fiscales")
-    escribir_encabezado(ws4, "CALENDARIO TRIBUTARIO FEBRERO 2025",
-                        "Obligaciones fiscales proximas a vencer")
-    cols4 = ["Obligacion","Periodo","Vencimiento","Dias Restantes","Estado","Valor Aprox ($)"]
+    # ── Hoja 4: Calendario DIAN ───────────────────────────────────────────────
+    ws4 = wb.create_sheet("Calendario DIAN")
+    escribir_encabezado(ws4, "PRÓXIMAS OBLIGACIONES FISCALES",
+                        f"Calculado desde {date.today().strftime('%d/%m/%Y')} — verificar NIT en DIAN")
+    cols4 = ["Obligación", "Período", "Fecha Vencimiento", "Días Restantes", "Estado"]
     for j, c in enumerate(cols4, 1):
         cell = ws4.cell(row=5, column=j, value=c)
         cell.font = Font(bold=True, color="FFFFFF", size=9, name="Calibri")
         cell.fill = hdr_fill(AZUL_OSC)
         cell.alignment = Alignment(horizontal="center")
         cell.border = border_thin()
-    for i, ob in enumerate(OBLIGACIONES_FISCALES, 6):
+    hoy = date.today()
+    for i, ob in enumerate(_calendario_dian_proximas(), 6):
         venc = datetime.strptime(ob["vencimiento"], "%Y-%m-%d").date()
         dias = (venc - hoy).days
-        color_fila = ROJO_CLA if dias < 5 else (AMARILLO_CL if dias <= 15 else VERDE_CLA)
-        datos = [ob["obligacion"], ob["periodo"], ob["vencimiento"],
-                 dias, ob["estado"], ob["valor_aprox"]]
-        for j, v in enumerate(datos, 1):
+        color = ROJO_CLA if dias < 5 else (AMARILLO_CL if dias <= 15 else VERDE_CLA)
+        vals = [ob["obligacion"], ob["periodo"], ob["vencimiento"], dias, "PENDIENTE"]
+        for j, v in enumerate(vals, 1):
             cell = ws4.cell(row=i, column=j, value=v)
             cell.font = font(size=9)
             cell.border = border_thin()
-            cell.fill = hdr_fill(color_fila)
-            if j == 6:
-                cell.number_format = "#,##0"
-                cell.alignment = Alignment(horizontal="right")
-    widths4 = [28,18,15,15,12,18]
+            cell.fill = hdr_fill(color)
+            if j in (3, 4):
+                cell.alignment = Alignment(horizontal="center")
+    widths4 = [28, 20, 18, 15, 12]
     for j, w in enumerate(widths4, 1): fmt_col(ws4, j, w)
+    # Nota al pie
+    last4 = 5 + len(_calendario_dian_proximas())
+    nota4 = ws4.cell(row=last4+2, column=1,
+        value="* Fechas basadas en calendario general colombiano. Confirmar según dígito verificador del NIT.")
+    nota4.font = Font(italic=True, size=8, color="888888", name="Calibri")
+    ws4.merge_cells(f"A{last4+2}:E{last4+2}")
 
-    # Hoja 5 - Resumen
+    # ── Hoja 5: Resumen Ejecutivo ─────────────────────────────────────────────
     ws5 = wb.create_sheet("Resumen Ejecutivo")
     ws5.sheet_view.showGridLines = False
-    escribir_encabezado(ws5, "RESUMEN EJECUTIVO CONCILIACION ENERO 2025",
-                        "Distribuidora El Progreso S.A.S. | NIT: 901.234.567-1")
-    res = resultado["resumen"]
+    escribir_encabezado(ws5, "RESUMEN EJECUTIVO",
+                        f"Metrika Group | {date.today().strftime('%d/%m/%Y')}")
     metricas = [
         ("", ""),
-        ("CONCILIACION BANCARIA", ""),
-        ("Movimientos conciliados",        res["total_conciliados"]),
-        ("Partidas solo en banco",         res["total_solo_banco"]),
-        ("Partidas solo en contabilidad",  res["total_solo_conta"]),
-        ("Debitos banco",                  res["debitos_banco"]),
-        ("Creditos banco",                 res["creditos_banco"]),
-        ("Diferencia debitos",             res["diferencia_debitos"]),
-        ("Diferencia creditos",            res["diferencia_creditos"]),
+        ("MOVIMIENTOS DEL EXTRACTO", ""),
+        ("Total transacciones",          res["total_tx"]),
+        ("Clasificados con PUC",         res["total_clasificados"]),
+        ("Sin clasificar",               res["total_sin_clasificar"]),
+        ("Total débitos",                res["debitos_banco"]),
+        ("Total créditos",               res["creditos_banco"]),
+        ("Saldo neto del período",       res["saldo_neto"]),
         ("", ""),
-        ("PAGOS PENDIENTES", ""),
-        ("Total por pagar proveedores",    sum(p["valor"] for p in PAGOS_PENDIENTES)),
-        ("Pagos vencidos",                 sum(p["valor"] for p in PAGOS_PENDIENTES if p["estado"] == "VENCIDO")),
-        ("Pagos proximos a vencer",        sum(p["valor"] for p in PAGOS_PENDIENTES if p["estado"] == "PROXIMO")),
+        ("NOTA", "Para conciliación completa importar registros de OSSADO"),
     ]
     for i, (etiqueta, valor) in enumerate(metricas, 5):
         cell_e = ws5.cell(row=i, column=2, value=etiqueta)
         cell_v = ws5.cell(row=i, column=4, value=valor if valor != "" else "")
-        if etiqueta in ("CONCILIACION BANCARIA", "PAGOS PENDIENTES"):
+        if etiqueta in ("MOVIMIENTOS DEL EXTRACTO",):
             cell_e.font = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
             cell_e.fill = hdr_fill(NEGRO)
             ws5.merge_cells(f"B{i}:E{i}")
             ws5.row_dimensions[i].height = 22
+        elif etiqueta == "NOTA":
+            cell_e.font = Font(bold=True, color=AZUL_OSC, size=9, name="Calibri")
+            cell_e.fill = hdr_fill(AMARILLO_CL)
+            cell_v.font = Font(italic=True, color=AZUL_OSC, size=9, name="Calibri")
+            cell_v.fill = hdr_fill(AMARILLO_CL)
+            cell_e.border = border_thin()
+            cell_v.border = border_thin()
         elif etiqueta:
             cell_e.font = font(size=10)
             cell_e.fill = hdr_fill(GRIS_CLARO)
@@ -674,6 +582,8 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     wb.save(buf)
     buf.seek(0)
     return buf.read()
+
+# ─── Claude + Twilio ──────────────────────────────────────────────────────────
 
 def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
     prompt = mensaje
@@ -706,12 +616,10 @@ def subir_excel_twilio(excel_bytes: bytes, filename: str) -> str:
     path = f"/tmp/{filename}"
     with open(path, "wb") as f:
         f.write(excel_bytes)
-    # Verificar que el archivo se escribió correctamente
     size = os.path.getsize(path)
     if size == 0:
         raise RuntimeError(f"El archivo {filename} se escribió vacío en disco")
     log.info(f"Excel guardado en disco: {path} — {size:,} bytes")
-    # RAILWAY_PUBLIC_DOMAIN no incluye protocolo; añadir https:// si falta
     raw_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8000")
     if raw_domain.startswith("http"):
         base = raw_domain.rstrip("/")
@@ -721,13 +629,14 @@ def subir_excel_twilio(excel_bytes: bytes, filename: str) -> str:
     log.info(f"URL de descarga generada: {url}")
     return url
 
+# ─── Endpoints HTTP ───────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
     return {"status": "ok", "agente": "Auxiliar Contable Metrika Group", "version": "1.0"}
 
 @app.get("/descargar/{filename}")
 def descargar_archivo(filename: str):
-    # Bloquear path traversal
     if ".." in filename or "/" in filename:
         raise HTTPException(400, "Nombre de archivo inválido")
     path = f"/tmp/{filename}"
@@ -745,7 +654,6 @@ def descargar_archivo(filename: str):
 
 @app.post("/procesar-pdf")
 async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
-    """Endpoint directo para subir PDF desde la interfaz web."""
     try:
         pdf_bytes = await pdf.read()
         log.info(f"PDF recibido por web — {len(pdf_bytes):,} bytes, filename: {pdf.filename}")
@@ -756,7 +664,6 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
         excel_bytes = generar_excel_conciliacion(resultado)
         filename = f"Conciliacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         url_excel = subir_excel_twilio(excel_bytes, filename)
-        # Transformar mov_banco al formato que usa la interfaz web
         movimientos_banco = [
             {
                 "id": f"t{i+1}",
@@ -765,10 +672,10 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
                 "doc": m.get("doc", ""),
                 "valor": m["credito"] if m["credito"] > 0 else m["debito"],
                 "tipo": "CR" if m["credito"] > 0 else "DB",
-                "cuenta_puc": None,
+                "cuenta_puc": m.get("cuenta_puc"),
                 "aprobado": False,
             }
-            for i, m in enumerate(mov_banco)
+            for i, m in enumerate(resultado["mov_banco"])
         ]
         return JSONResponse({
             "status": "ok",
@@ -777,8 +684,9 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
             "excel_url": url_excel,
             "movimientos_banco": movimientos_banco,
             "conciliados": resultado["conciliados"],
-            "solo_banco": resultado["solo_banco"],
-            "solo_conta": resultado["solo_conta"],
+            "solo_banco":  resultado["solo_banco"],
+            "solo_conta":  resultado["solo_conta"],
+            "nota":        resultado["nota"],
         })
     except HTTPException:
         raise
@@ -786,6 +694,9 @@ async def endpoint_procesar_pdf(pdf: UploadFile = File(...)):
         log.error(f"Error en /procesar-pdf: {e}", exc_info=True)
         raise HTTPException(500, f"Error procesando PDF: {str(e)}")
 
+# ─── Webhook WhatsApp ─────────────────────────────────────────────────────────
+
+_MSG_SIN_PDF = "⚠️ Primero envíame el PDF de tu extracto bancario para comenzar."
 
 @app.post("/webhook/whatsapp")
 async def webhook_whatsapp(
@@ -813,14 +724,13 @@ async def webhook_whatsapp(
     # ── Comando: clasificar ──────────────────────────────────────────────────
     if "clasificar" in mensaje:
         if not sesion:
-            enviar_whatsapp(numero, "⚠️ No hay extracto cargado. Envíame primero el PDF de Bancolombia.")
+            enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
         top10 = sesion.resumen["top10"][:10]
         lineas = []
         for m in top10:
             val  = m["credito"] if m["credito"] > 0 else -m["debito"]
             puc  = m.get("cuenta_puc") or "—"
-            nom  = m.get("nombre_puc") or "Sin clasificar"
             signo = "✅" if m["credito"] > 0 else "🔴"
             lineas.append(f"{signo} {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(abs(val))} | PUC {puc}")
         msg = "📊 *Top 10 Transacciones con PUC*\n\n" + "\n".join(lineas)
@@ -830,7 +740,7 @@ async def webhook_whatsapp(
     # ── Comando: saldo ───────────────────────────────────────────────────────
     if mensaje in ("saldo", "saldo actual", "mi saldo", "ver saldo"):
         if not sesion:
-            enviar_whatsapp(numero, "⚠️ No hay extracto cargado. Envíame primero el PDF de Bancolombia.")
+            enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
         r = sesion.resumen
         msg = (
@@ -845,6 +755,9 @@ async def webhook_whatsapp(
 
     # ── Comando: pagos pendientes ────────────────────────────────────────────
     if any(k in mensaje for k in ["pagos", "pendientes", "vencimientos", "proveedores"]):
+        if not sesion:
+            enviar_whatsapp(numero, _MSG_SIN_PDF)
+            return {"status": "ok"}
         background_tasks.add_task(reporte_pagos_pendientes, numero)
         return {"status": "ok"}
 
@@ -860,10 +773,10 @@ async def webhook_whatsapp(
             f"¡Hola! Soy *CONTA*, tu Auxiliar Contable de Metrika Group.\n\n"
             f"Estado: {tiene_extracto}\n\n"
             f"Comandos disponibles:\n"
-            f"- Envía el *PDF* del extracto Bancolombia\n"
+            f"- Envía el *PDF* del extracto bancario\n"
             f"- *clasificar* → top 10 con cuenta PUC\n"
             f"- *saldo* → resumen del período\n"
-            f"- *pagos pendientes* → proveedores\n"
+            f"- *pagos pendientes* → principales egresos\n"
             f"- *impuestos* → calendario DIAN\n"
             f"- Cualquier otra pregunta contable")
         return {"status": "ok"}
@@ -871,6 +784,8 @@ async def webhook_whatsapp(
     # ── Consulta libre → Claude con contexto de sesión ───────────────────────
     background_tasks.add_task(responder_consulta_libre, numero, Body, sesion)
     return {"status": "ok"}
+
+# ─── Tareas en background ─────────────────────────────────────────────────────
 
 async def procesar_extracto_pdf(numero: str, media_url: str):
     try:
@@ -898,16 +813,12 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
 
         mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
-            enviar_whatsapp(numero, "❌ No pude leer los movimientos del PDF. Asegúrate de que sea un extracto Bancolombia en formato texto.")
+            enviar_whatsapp(numero, "❌ No pude leer los movimientos del PDF. Asegúrate de que sea un extracto bancario en formato texto.")
             return
 
-        # Clasificar con reglas locales primero
         clasificados = clasificar_con_reglas_locales(mov_banco)
-
-        # Calcular resumen
         resumen = computar_resumen_wa(clasificados)
 
-        # Guardar sesión (TTL 24 h)
         SESIONES[numero] = SesionExtracto(
             mov_banco=mov_banco,
             resumen=resumen,
@@ -915,25 +826,27 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
         )
         log.info(f"Sesión guardada para {numero} — {len(mov_banco)} movimientos")
 
-        # ── Respuesta principal al usuario ───────────────────────────────────
+        clasificados_n  = sum(1 for m in clasificados if m.get("cuenta_puc"))
+        sin_clasificar_n = len(clasificados) - clasificados_n
+
         enviar_whatsapp(numero,
             f"✅ *Extracto procesado*\n\n"
             f"📊 Transacciones: {resumen['total_tx']}\n"
             f"💚 Ingresos: {fmt_cop(resumen['ingresos'])}\n"
             f"🔴 Egresos: {fmt_cop(resumen['egresos'])}\n"
-            f"💰 Saldo: {fmt_cop(resumen['saldo'])}\n\n"
+            f"💰 Saldo: {fmt_cop(resumen['saldo'])}\n"
+            f"🏷️ Clasificados PUC: {clasificados_n} | Sin clasificar: {sin_clasificar_n}\n\n"
             f"Escribe *clasificar* para ver el top 10 con cuenta PUC\n"
             f"Escribe *saldo* para ver el resumen en cualquier momento"
         )
 
-        # ── Excel en background (puede fallar sin romper el flujo) ───────────
         try:
             resultado_conc = conciliar(mov_banco)
             excel_bytes = generar_excel_conciliacion(resultado_conc)
             filename = f"Conciliacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             url_excel = subir_excel_twilio(excel_bytes, filename)
             try:
-                enviar_whatsapp_media(numero, "📎 Aquí tu Excel de conciliación completo:", url_excel)
+                enviar_whatsapp_media(numero, "📎 Aquí tu Excel de análisis contable:", url_excel)
             except Exception:
                 enviar_whatsapp(numero, f"📎 Descarga el Excel aquí:\n{url_excel}")
         except Exception as e:
@@ -943,26 +856,49 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
         log.error(f"Error en procesar_extracto_pdf: {e}", exc_info=True)
         enviar_whatsapp(numero, "❌ Ocurrió un error procesando el extracto. Intenta de nuevo.")
 
+
 def reporte_pagos_pendientes(numero: str):
-    hoy = date.today()
-    msg = "Pagos Pendientes a Proveedores\n\n"
-    for p in PAGOS_PENDIENTES:
-        venc = datetime.strptime(p["vencimiento"], "%Y-%m-%d").date()
-        dias = (venc - hoy).days
-        estado = "VENCIDO hace " + str(abs(dias)) + " dias" if dias < 0 else "Vence en " + str(dias) + " dias"
-        msg += f"{p['proveedor']}\n{p['concepto']}\n${p['valor']:,.0f} | {estado}\n\n"
-    msg += f"Total por pagar: ${sum(p['valor'] for p in PAGOS_PENDIENTES):,.0f}"
+    sesion = SESIONES.get(numero)
+    if not sesion:
+        enviar_whatsapp(numero, _MSG_SIN_PDF)
+        return
+
+    agrupado: dict[str, dict] = defaultdict(lambda: {"n": 0, "total": 0.0, "ultimo": ""})
+    for m in sesion.clasificados:
+        if m["debito"] > 0:
+            clave = m["concepto"][:40].strip().upper()
+            agrupado[clave]["n"] += 1
+            agrupado[clave]["total"] += m["debito"]
+            if m["fecha"] > agrupado[clave]["ultimo"]:
+                agrupado[clave]["ultimo"] = m["fecha"]
+
+    top = sorted(agrupado.items(), key=lambda x: x[1]["total"], reverse=True)[:8]
+
+    if not top:
+        enviar_whatsapp(numero, "ℹ️ No se encontraron egresos en el extracto cargado.")
+        return
+
+    msg = "💸 *Principales Egresos del Período*\n\n"
+    for concepto, d in top:
+        msg += f"• {concepto[:35]}\n  {fmt_cop(d['total'])} ({d['n']} mov) — último: {d['ultimo']}\n\n"
+
+    msg += f"_Total egresos período: {fmt_cop(sesion.resumen['egresos'])}_\n\n"
+    msg += "ℹ️ Para ver facturas y vencimientos pendientes, sincroniza con OSSADO."
     enviar_whatsapp(numero, msg)
 
+
 def reporte_fiscal(numero: str):
+    obligaciones = _calendario_dian_proximas()
     hoy = date.today()
-    msg = "Obligaciones Fiscales - Febrero 2025\n\n"
-    for ob in OBLIGACIONES_FISCALES:
+    msg = f"📅 *Próximas Obligaciones Fiscales*\n_{hoy.strftime('%d/%m/%Y')}_\n\n"
+    for ob in obligaciones:
         venc = datetime.strptime(ob["vencimiento"], "%Y-%m-%d").date()
         dias = (venc - hoy).days
-        msg += f"{ob['obligacion']}\nPeriodo: {ob['periodo']}\nVence: {ob['vencimiento']} ({dias} dias)\nValor aprox: ${ob['valor_aprox']:,.0f}\n\n"
-    msg += "Recuerda verificar las fechas exactas segun tu NIT en el calendario DIAN."
+        icono = "🔴" if dias < 5 else ("⚠️" if dias <= 15 else "✅")
+        msg += f"{icono} *{ob['obligacion']}*\nPeríodo: {ob['periodo']}\nVence: {ob['vencimiento']} ({dias} días)\n\n"
+    msg += "_Verifica las fechas exactas según tu NIT en el calendario DIAN._"
     enviar_whatsapp(numero, msg)
+
 
 def responder_consulta_libre(numero: str, mensaje: str, sesion: "SesionExtracto | None" = None):
     contexto = ""
