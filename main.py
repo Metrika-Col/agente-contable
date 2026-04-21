@@ -2,7 +2,7 @@
 Agente Auxiliar Contable — Metrika Group
 FastAPI + Claude API + Twilio WhatsApp + openpyxl
 """
-import os, io, re, logging
+import os, io, re, logging, math
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -427,10 +427,8 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin()
     ws1.row_dimensions[5].height = 28
-    max_desc_len = 10  # para auto-fit de la columna descripción
     for i, m in enumerate(clasificados, 6):
         concepto = m["concepto"]
-        max_desc_len = max(max_desc_len, len(concepto))
         vals = [m["fecha"], concepto, m["debito"] or None,
                 m["credito"] or None, m.get("saldo") or None,
                 m.get("cuenta_puc", ""), m.get("nombre_puc", "")]
@@ -439,16 +437,17 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
             cell.font   = font(size=9)
             cell.border = border_thin()
             cell.fill   = hdr_fill(VERDE_CLA) if i % 2 == 0 else hdr_fill("FFFFFF")
-            if j == 2:  # columna descripción: texto completo con wrap
+            if j == 2:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
             elif j in (3, 4, 5) and v:
                 cell.number_format = "#,##0"
                 cell.alignment = Alignment(horizontal="right", vertical="top")
             else:
                 cell.alignment = Alignment(vertical="top")
-        ws1.row_dimensions[i].height = max(30, min(60, 12 + (len(concepto) // 30) * 12))
-    # Ancho columna descripción: auto-fit basado en contenido (máx 80)
-    widths1 = [12, min(max_desc_len + 4, 80), 14, 14, 14, 12, 28]
+        descripcion = str(ws1.cell(row=i, column=2).value or "")
+        lineas = math.ceil(len(descripcion) / 45)
+        ws1.row_dimensions[i].height = max(18, lineas * 15)
+    widths1 = [12, 45, 14, 14, 14, 12, 28]
     for j, w in enumerate(widths1, 1): fmt_col(ws1, j, w)
 
     # ── Hoja 2: Sin clasificar ────────────────────────────────────────────────
@@ -477,10 +476,17 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
             cell.font = font(size=9)
             cell.border = border_thin()
             cell.fill = hdr_fill(AMARILLO_CL)
-            if j in (3, 4, 5) and v:
+            if j == 2:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            elif j in (3, 4, 5) and v:
                 cell.number_format = "#,##0"
-                cell.alignment = Alignment(horizontal="right")
-    widths2 = [12, 40, 14, 14, 14, 10, 35]
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+        descripcion = str(ws2.cell(row=i, column=2).value or "")
+        lineas = math.ceil(len(descripcion) / 45)
+        ws2.row_dimensions[i].height = max(18, lineas * 15)
+    widths2 = [12, 45, 14, 14, 14, 10, 35]
     for j, w in enumerate(widths2, 1): fmt_col(ws2, j, w)
 
     # ── Hoja 3: Top Egresos ───────────────────────────────────────────────────
@@ -502,9 +508,16 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
             cell.font = font(size=9)
             cell.border = border_thin()
             cell.fill = hdr_fill(ROJO_CLA) if i % 2 == 0 else hdr_fill("FFFFFF")
-            if j == 3:
+            if j == 2:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            elif j == 3:
                 cell.number_format = "#,##0"
-                cell.alignment = Alignment(horizontal="right")
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+        descripcion = str(ws3.cell(row=i, column=2).value or "")
+        lineas = math.ceil(len(descripcion) / 45)
+        ws3.row_dimensions[i].height = max(18, lineas * 15)
     widths3 = [12, 45, 14, 12, 28]
     for j, w in enumerate(widths3, 1): fmt_col(ws3, j, w)
     last3 = 5 + len(top_egresos)
