@@ -416,7 +416,7 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
 
     # ── Hoja 1: Movimientos clasificados ─────────────────────────────────────
     ws1 = wb.active
-    ws1.title = "Movimientos"
+    ws1.title = "Clasificados PUC"
     escribir_encabezado(ws1, "MOVIMIENTOS CLASIFICADOS POR PUC",
                         f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     cols1 = ["Fecha", "Concepto", "Débito ($)", "Crédito ($)", "Saldo ($)", "Cuenta PUC", "Nombre PUC"]
@@ -521,11 +521,15 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     widths3 = [12, 45, 14, 12, 28]
     for j, w in enumerate(widths3, 1): fmt_col(ws3, j, w)
     last3 = 5 + len(top_egresos)
-    ws3.cell(row=last3+1, column=2, value="TOTAL EGRESOS:").font = font(bold=True)
-    tc3 = ws3.cell(row=last3+1, column=3, value=res["debitos_banco"])
+    total_egresos_real = sum((m.get("debito") or 0) for m in clasificados + sin_clasi)
+    lbl3 = ws3.cell(row=last3+1, column=2, value="TOTAL EGRESOS (todos los cargos):")
+    lbl3.font = Font(bold=True, size=9, name="Calibri")
+    lbl3.alignment = Alignment(horizontal="right")
+    tc3 = ws3.cell(row=last3+1, column=3, value=total_egresos_real)
     tc3.number_format = "#,##0"
     tc3.font = Font(bold=True, size=10, color=ROJO_OSC, name="Calibri")
     tc3.alignment = Alignment(horizontal="right")
+    tc3.border = border_thin()
 
     # ── Hoja 4: Calendario DIAN ───────────────────────────────────────────────
     ws4 = wb.create_sheet("Calendario DIAN")
@@ -603,6 +607,73 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     fmt_col(ws5, 2, 35)
     fmt_col(ws5, 3, 5)
     fmt_col(ws5, 4, 18)
+
+    # ── Hoja 6: Movimientos — extracto completo ──────────────────────────────
+    ws6 = wb.create_sheet("Movimientos")
+    escribir_encabezado(ws6, "EXTRACTO COMPLETO — TODOS LOS MOVIMIENTOS",
+                        f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    AMARILLO_TX = "FFCC00"
+    cols6 = ["Fecha", "Descripción", "Valor ($)", "Saldo ($)"]
+    for j, c in enumerate(cols6, 1):
+        cell = ws6.cell(row=5, column=j, value=c)
+        cell.font  = Font(bold=True, color=AMARILLO_TX, size=9, name="Calibri")
+        cell.fill  = hdr_fill(NEGRO)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border_thin()
+    ws6.row_dimensions[5].height = 28
+    # Combinar clasificados + sin_clasificar y ordenar por fecha
+    todos_movs = sorted(
+        clasificados + sin_clasi,
+        key=lambda m: m.get("fecha") or ""
+    )
+    total_abonos = 0.0
+    total_cargos = 0.0
+    for i, m in enumerate(todos_movs, 6):
+        credito = m.get("credito") or 0
+        debito  = m.get("debito")  or 0
+        valor   = credito if credito > 0 else -debito
+        saldo   = m.get("saldo") or None
+        if valor > 0:
+            total_abonos += valor
+        else:
+            total_cargos += abs(valor)
+        vals6 = [m.get("fecha", ""), m.get("concepto", ""), valor, saldo]
+        for j, v in enumerate(vals6, 1):
+            cell = ws6.cell(row=i, column=j, value=v)
+            cell.font   = font(size=9)
+            cell.border = border_thin()
+            cell.fill   = hdr_fill(VERDE_CLA) if valor > 0 else hdr_fill(ROJO_CLA)
+            if j == 2:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            elif j in (3, 4) and v is not None:
+                cell.number_format = '#,##0;-#,##0'
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+        descripcion6 = str(ws6.cell(row=i, column=2).value or "")
+        lineas6 = math.ceil(len(descripcion6) / 45)
+        ws6.row_dimensions[i].height = max(18, lineas6 * 15)
+    widths6 = [12, 45, 16, 16]
+    for j, w in enumerate(widths6, 1): fmt_col(ws6, j, w)
+    # ── Fila de totales ──
+    saldo_neto = total_abonos - total_cargos
+    last6 = 5 + len(todos_movs)
+    totales6 = [
+        ("TOTAL ABONOS:",  total_abonos,  VERDE_OSC),
+        ("TOTAL CARGOS:", -total_cargos,  ROJO_OSC),
+        ("SALDO NETO:",    saldo_neto,    AZUL_OSC),
+    ]
+    for offset, (lbl, val, color) in enumerate(totales6, 1):
+        row = last6 + offset
+        ws6.row_dimensions[row].height = 20
+        lbl_cell = ws6.cell(row=row, column=2, value=lbl)
+        lbl_cell.font = Font(bold=True, size=9, color=color, name="Calibri")
+        lbl_cell.alignment = Alignment(horizontal="right")
+        val_cell = ws6.cell(row=row, column=3, value=val)
+        val_cell.number_format = '#,##0;-#,##0'
+        val_cell.font = Font(bold=True, size=10, color=color, name="Calibri")
+        val_cell.alignment = Alignment(horizontal="right")
+        val_cell.border = border_thin()
 
     buf = io.BytesIO()
     wb.save(buf)
