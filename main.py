@@ -36,7 +36,9 @@ gemini  = genai.GenerativeModel("gemini-2.0-flash")
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
 SYSTEM_PROMPT = """Eres CONTA, auxiliar contable de Metrika Group.
-Respondes en español, eres preciso y conciso."""
+Respondes en español, eres preciso y conciso.
+Responde siempre en máximo 800 caracteres. Sé conciso y directo.
+Si necesitas más espacio, ofrece responder por partes."""
 
 # ─── Sesiones por número de teléfono (TTL 24 h) ──────────────────────────────
 from dataclasses import dataclass, field as dc_field
@@ -682,6 +684,9 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
 
 # ─── Claude + Twilio ──────────────────────────────────────────────────────────
 
+_WA_MAX = 1500
+_WA_TRUNC = 1450
+
 def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
     prompt = f"{SYSTEM_PROMPT}\n\n"
     if contexto_extra:
@@ -689,17 +694,34 @@ def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
     prompt += f"Usuario: {mensaje}"
     try:
         response = gemini.generate_content(prompt)
-        return response.text
+        texto = response.text
+        if len(texto) > _WA_MAX:
+            texto = texto[:_WA_TRUNC] + "...\n\n_(Respuesta truncada. Pregunta más específico)_"
+        return texto
     except Exception as e:
         log.error(f"[consultar_agente] Gemini error — {type(e).__name__}: {e}", exc_info=True)
         return f"❌ Error al consultar el asistente: {type(e).__name__}: {e}"
 
+def _partir_mensaje(texto: str, max_chars: int = _WA_MAX) -> list[str]:
+    """Divide texto en partes de max_chars sin cortar palabras."""
+    if len(texto) <= max_chars:
+        return [texto]
+    partes = []
+    while texto:
+        if len(texto) <= max_chars:
+            partes.append(texto)
+            break
+        corte = texto.rfind(" ", 0, max_chars)
+        if corte == -1:
+            corte = max_chars
+        partes.append(texto[:corte].rstrip())
+        texto = texto[corte:].lstrip()
+    return partes
+
 def enviar_whatsapp(to: str, body: str):
-    twilio.messages.create(
-        from_=TWILIO_WA_NUMBER,
-        to=f"whatsapp:{to}" if not to.startswith("whatsapp:") else to,
-        body=body
-    )
+    dest = f"whatsapp:{to}" if not to.startswith("whatsapp:") else to
+    for parte in _partir_mensaje(body):
+        twilio.messages.create(from_=TWILIO_WA_NUMBER, to=dest, body=parte)
 
 def enviar_whatsapp_media(to: str, body: str, media_url: str):
     twilio.messages.create(
