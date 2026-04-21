@@ -2,7 +2,7 @@
 Agente Auxiliar Contable — Metrika Group
 FastAPI + Claude API + Twilio WhatsApp + openpyxl
 """
-import os, io, re, logging, math
+import os, io, re, logging, math, time
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -31,14 +31,11 @@ TWILIO_WA_NUMBER   = os.getenv("TWILIO_WA_NUMBER", "whatsapp:+14155238886")
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio  = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini  = genai.GenerativeModel("gemini-2.0-flash")
+gemini  = genai.GenerativeModel("gemini-1.5-flash-8b")
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
-SYSTEM_PROMPT = """Eres CONTA, auxiliar contable de Metrika Group.
-Respondes en español, eres preciso y conciso.
-Responde siempre en máximo 800 caracteres. Sé conciso y directo.
-Si necesitas más espacio, ofrece responder por partes."""
+SYSTEM_PROMPT = "Eres CONTA, auxiliar contable. Responde en español, máximo 800 caracteres, conciso. Si necesitas más espacio, ofrece responder por partes."
 
 # ─── Sesiones por número de teléfono (TTL 24 h) ──────────────────────────────
 from dataclasses import dataclass, field as dc_field
@@ -688,12 +685,22 @@ _WA_MAX = 1500
 _WA_TRUNC = 1450
 
 def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
+    if contexto_extra and len(contexto_extra) > 500:
+        contexto_extra = contexto_extra[:500]
     prompt = f"{SYSTEM_PROMPT}\n\n"
     if contexto_extra:
         prompt += f"{contexto_extra}\n\n"
     prompt += f"Usuario: {mensaje}"
     try:
-        response = gemini.generate_content(prompt)
+        try:
+            response = gemini.generate_content(prompt)
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                log.warning(f"[consultar_agente] 429 quota — reintentando en 20s")
+                time.sleep(20)
+                response = gemini.generate_content(prompt)
+            else:
+                raise
         texto = response.text
         if len(texto) > _WA_MAX:
             texto = texto[:_WA_TRUNC] + "...\n\n_(Respuesta truncada. Pregunta más específico)_"
