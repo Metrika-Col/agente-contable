@@ -859,6 +859,7 @@ async def webhook_whatsapp(
 
     # ── PDF adjunto → procesar y guardar sesión ──────────────────────────────
     if int(NumMedia) > 0 and "pdf" in MediaContentType0.lower():
+        log.info(f"WA {numero}: rama=PDF")
         background_tasks.add_task(procesar_extracto_pdf, numero, MediaUrl0)
         enviar_whatsapp(numero,
             "📄 Recibí tu extracto. Procesando... en unos segundos te envío el resumen.")
@@ -868,6 +869,7 @@ async def webhook_whatsapp(
 
     # ── Comando: clasificar ──────────────────────────────────────────────────
     if "clasificar" in mensaje:
+        log.info(f"WA {numero}: rama=clasificar")
         if not sesion:
             enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
@@ -888,7 +890,8 @@ async def webhook_whatsapp(
         return {"status": "ok"}
 
     # ── Comando: saldo ───────────────────────────────────────────────────────
-    if mensaje in ("saldo", "saldo actual", "mi saldo", "ver saldo"):
+    if any(k in mensaje for k in ["saldo"]):
+        log.info(f"WA {numero}: rama=saldo")
         if not sesion:
             enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
@@ -905,6 +908,7 @@ async def webhook_whatsapp(
 
     # ── Comando: pagos pendientes ────────────────────────────────────────────
     if any(k in mensaje for k in ["pagos", "pendientes", "vencimientos", "proveedores"]):
+        log.info(f"WA {numero}: rama=pagos_pendientes")
         if not sesion:
             enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
@@ -913,11 +917,13 @@ async def webhook_whatsapp(
 
     # ── Comando: impuestos / DIAN ────────────────────────────────────────────
     if any(k in mensaje for k in ["impuestos", "fiscal", "tributario", "dian", "obligaciones"]):
+        log.info(f"WA {numero}: rama=fiscal")
         background_tasks.add_task(reporte_fiscal, numero)
         return {"status": "ok"}
 
     # ── Saludo / ayuda ───────────────────────────────────────────────────────
     if any(k in mensaje for k in ["ayuda", "help", "hola", "buenas", "buenos", "menu"]):
+        log.info(f"WA {numero}: rama=ayuda")
         tiene_extracto = "✅ Extracto cargado" if sesion else "📄 Sin extracto — envía el PDF para comenzar"
         enviar_whatsapp(numero,
             f"¡Hola! Soy *CONTA*, tu Auxiliar Contable de Metrika Group.\n\n"
@@ -931,7 +937,8 @@ async def webhook_whatsapp(
             f"- Cualquier otra pregunta contable")
         return {"status": "ok"}
 
-    # ── Consulta libre → Claude con contexto de sesión ───────────────────────
+    # ── Consulta libre → Gemini con contexto de sesión ───────────────────────
+    log.info(f"WA {numero}: rama=consulta_libre — '{Body[:60]}'")
     background_tasks.add_task(responder_consulta_libre, numero, Body, sesion)
     return {"status": "ok"}
 
@@ -1051,27 +1058,36 @@ def reporte_fiscal(numero: str):
 
 
 def responder_consulta_libre(numero: str, mensaje: str, sesion: "SesionExtracto | None" = None):
-    contexto = ""
-    if sesion:
-        r = sesion.resumen
-        top5 = sesion.resumen["top10"][:5]
-        lineas_top = "\n".join(
-            f"  {m['fecha']} | {m['concepto'][:35]} | "
-            f"{fmt_cop(m['credito'] if m['credito'] > 0 else m['debito'])} | "
-            f"{'Abono' if m['credito'] > 0 else 'Cargo'} | PUC {m.get('cuenta_puc') or '—'}"
-            for m in top5
-        )
-        dist_lineas = "\n".join(
-            f"  PUC {cod} {v['nombre']}: {v['n']} mov · {fmt_cop(v['total'])}"
-            for cod, v in list(r["por_cuenta"].items())[:6]
-        )
-        contexto = (
-            f"EXTRACTO BANCARIO CARGADO ({r['total_tx']} transacciones):\n"
-            f"- Ingresos: {fmt_cop(r['ingresos'])}\n"
-            f"- Egresos:  {fmt_cop(r['egresos'])}\n"
-            f"- Saldo neto: {fmt_cop(r['saldo'])}\n\n"
-            f"TOP 5 POR VALOR:\n{lineas_top}\n\n"
-            f"DISTRIBUCIÓN PUC:\n{dist_lineas}"
-        )
-    respuesta = consultar_agente(mensaje, contexto)
-    enviar_whatsapp(numero, respuesta)
+    try:
+        contexto = ""
+        if sesion:
+            r = sesion.resumen
+            top5 = sesion.resumen["top10"][:5]
+            lineas_top = "\n".join(
+                f"  {m['fecha']} | {m['concepto'][:35]} | "
+                f"{fmt_cop(m['credito'] if m['credito'] > 0 else m['debito'])} | "
+                f"{'Abono' if m['credito'] > 0 else 'Cargo'} | PUC {m.get('cuenta_puc') or '—'}"
+                for m in top5
+            )
+            dist_lineas = "\n".join(
+                f"  PUC {cod} {v['nombre']}: {v['n']} mov · {fmt_cop(v['total'])}"
+                for cod, v in list(r["por_cuenta"].items())[:6]
+            )
+            contexto = (
+                f"EXTRACTO BANCARIO CARGADO ({r['total_tx']} transacciones):\n"
+                f"- Ingresos: {fmt_cop(r['ingresos'])}\n"
+                f"- Egresos:  {fmt_cop(r['egresos'])}\n"
+                f"- Saldo neto: {fmt_cop(r['saldo'])}\n\n"
+                f"TOP 5 POR VALOR:\n{lineas_top}\n\n"
+                f"DISTRIBUCIÓN PUC:\n{dist_lineas}"
+            )
+        log.info(f"[consulta_libre] Enviando a Gemini: '{mensaje[:60]}' — con_sesion={sesion is not None}")
+        respuesta = consultar_agente(mensaje, contexto)
+        log.info(f"[consulta_libre] Gemini respondió ({len(respuesta)} chars)")
+        enviar_whatsapp(numero, respuesta)
+    except Exception as e:
+        log.error(f"[consulta_libre] Error inesperado: {type(e).__name__}: {e}", exc_info=True)
+        try:
+            enviar_whatsapp(numero, f"❌ Error al procesar tu consulta: {type(e).__name__}: {e}")
+        except Exception as e2:
+            log.error(f"[consulta_libre] No se pudo enviar error al usuario: {e2}")
