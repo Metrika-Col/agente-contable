@@ -682,32 +682,147 @@ def _es_factura(texto: str) -> bool:
     return tiene_nit and (tiene_subtotal or tiene_iva)
 
 def _extraer_datos_factura(texto: str) -> dict:
-    nit_m = re.search(r'NIT[\s.:]*(\d[\d.\-]+)', texto, re.IGNORECASE)
-    nit   = nit_m.group(1).strip() if nit_m else "No detectado"
+    t = texto
 
-    fecha_m = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', texto)
-    fecha   = fecha_m.group(0) if fecha_m else "No detectada"
+    # ── EMISOR (cascada) ─────────────────────────────────────────────────────
+    emisor = None
+    for pat, grp, flags in [
+        (r"Nombre\s+Raz[oó]n\s+Social\s+Emisor[:\s]*(.*?)(?:[,\n])", 1, re.IGNORECASE),
+        (r"^(.+?)\s+NIT",                                              1, re.IGNORECASE | re.MULTILINE),
+        (r"Raz[oó]n\s+Social[:\s]*(.*?)(?:\n|$)",                     1, re.IGNORECASE),
+        (r"Empresa[:\s]*(.*?)(?:\n|$)",                                1, re.IGNORECASE),
+    ]:
+        m = re.search(pat, t, flags)
+        if m:
+            emisor = m.group(grp).strip()
+            break
+    if not emisor:
+        lineas = [l.strip() for l in t.split('\n') if l.strip()]
+        emisor = lineas[0] if lineas else "No detectado"
+    emisor = emisor[:50]
 
-    iva_m = re.search(r'IVA[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
-    iva   = _parse_valor_co(iva_m.group(1)) if iva_m else 0.0
+    # ── NIT (cascada) ────────────────────────────────────────────────────────
+    nit = None
+    m = re.search(r"\d{3}\.?\d{3}\.?\d{3}-?\d", t)
+    if m:
+        nit = m.group(0)
+    if not nit:
+        m = re.search(r"NIT[:\s]+(\d[\d\.]+\-?\d)", t, re.IGNORECASE)
+        if m: nit = m.group(1).strip()
+    if not nit:
+        m = re.search(r"Nit\s+o\s+CC\.?:?\s*([\d\.]+)", t, re.IGNORECASE)
+        if m: nit = m.group(1).strip()
+    nit = nit or "No detectado"
 
-    total_m = re.search(r'TOTAL[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
-    total   = _parse_valor_co(total_m.group(1)) if total_m else 0.0
+    # ── FECHA (cascada, preferir vencimiento) ────────────────────────────────
+    fecha = None
+    for pat in [
+        r"[Vv]encimiento.*?(\d{1,2}/\w+/\d{4})",
+        r"[Vv]encimiento.*?(\d{2}/\d{2}/\d{4})",
+        r"[Ff]echa.*?(\d{2}/\d{2}/\d{4})",
+        r"(\d{2}-\d{2}-\d{4})",
+        r"(\d{2}/\d{2}/\d{4})",
+    ]:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            fecha = m.group(1)
+            break
+    fecha = fecha or str(date.today())
 
-    subtotal_m = re.search(r'SUBTOTAL[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
-    subtotal   = _parse_valor_co(subtotal_m.group(1)) if subtotal_m else max(0.0, total - iva)
+    # ── TOTAL (cascada, luego mayor valor del documento) ─────────────────────
+    total = 0.0
+    for pat in [
+        r"[Tt]otal\s+a\s+pagar[^\n$]*\$?\s*([\d,\.]+)",
+        r"TOTAL\s+A\s+PAGAR[^\n$]*\$?\s*([\d,\.]+)",
+        r"[Tt]otal[^\n$]*\$?\s*([\d,\.]+)",
+        r"[Vv]alor\s+total[^\n$]*\$?\s*([\d,\.]+)",
+        r"[Tt]otal\s+factura[^\n$]*\$?\s*([\d,\.]+)",
+    ]:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            v = _parse_valor_co(m.group(1))
+            if v > 0:
+                total = v
+                break
+    if total == 0.0:
+        candidatos = re.findall(r'\$?\s*(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?)', t)
+        valores = [_parse_valor_co(c) for c in candidatos if _parse_valor_co(c) > 0]
+        if valores:
+            total = max(valores)
 
-    lineas = [l.strip() for l in texto.split('\n') if l.strip()]
-    emisor = lineas[0][:50] if lineas else "No detectado"
+    # ── IVA (cascada) ────────────────────────────────────────────────────────
+    iva = 0.0
+    for pat in [
+        r"IVA[^\n$]*\$?\s*([\d,\.]+)",
+        r"[Ii]mpuesto[^\n$]*\$?\s*([\d,\.]+)",
+    ]:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            v = _parse_valor_co(m.group(1))
+            if v > 0:
+                iva = v
+                break
+
+    # ── SUBTOTAL (cascada) ───────────────────────────────────────────────────
+    subtotal = 0.0
+    for pat in [
+        r"[Ss]ubtotal[^\n$]*\$?\s*([\d,\.]+)",
+        r"[Ss]ub\s+total[^\n$]*\$?\s*([\d,\.]+)",
+    ]:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            v = _parse_valor_co(m.group(1))
+            if v > 0:
+                subtotal = v
+                break
+    if subtotal == 0.0:
+        subtotal = max(0.0, total - iva)
+
+    # ── TIPO Y CUENTA PUC SUGERIDA ───────────────────────────────────────────
+    tl = t.lower()
+    if any(k in tl for k in ["electricidad", "energia", "eléctrica", "electrica",
+                               "epm", "essa", "codensa", "electrificadora"]):
+        tipo = "Servicio público - Energía"
+        puc_cod, puc_nom = "5115", "Servicios públicos"
+    elif any(k in tl for k in ["agua", "acueducto", "alcantarillado", "aaa", "eaab",
+                                "triple a", "empresas municipales"]):
+        tipo = "Servicio público - Agua"
+        puc_cod, puc_nom = "5115", "Servicios públicos"
+    elif any(k in tl for k in ["gas natural", "vanti", "surtigas", "gases de occidente",
+                                "gases del caribe", "alcanos"]):
+        tipo = "Servicio público - Gas"
+        puc_cod, puc_nom = "5115", "Servicios públicos"
+    elif any(k in tl for k in ["internet", "fibra", "movistar", "claro", "tigo",
+                                "etb", "une ", "telecomunicaciones", "telefonia"]):
+        tipo = "Telecomunicaciones"
+        puc_cod, puc_nom = "5115", "Servicios públicos"
+    elif any(k in tl for k in ["arrendamiento", "arriendo", "canon de arriendo",
+                                "alquiler"]):
+        tipo = "Arrendamiento"
+        puc_cod, puc_nom = "5210", "Arrendamientos"
+    elif any(k in tl for k in ["honorarios", "consultoría", "consultoria",
+                                "servicios profesionales", "asesoría", "asesoria"]):
+        tipo = "Servicios profesionales"
+        puc_cod, puc_nom = "5305", "Honorarios"
+    elif any(k in tl for k in ["factura electrónica de venta", "factura electronica de venta",
+                                "supermercado", "almacén", "almacen", "tienda"]):
+        tipo = "Compra de bienes"
+        puc_cod, puc_nom = "5120", "Gastos generales"
+    else:
+        tipo = "Factura general"
+        puc_cod, puc_nom = "5290", "Otros gastos"
 
     return {
-        "emisor":    emisor,
-        "nit":       nit,
-        "fecha":     fecha,
-        "subtotal":  subtotal,
-        "iva":       iva,
-        "total":     total,
-        "timestamp": str(datetime.now().date()),
+        "emisor":       emisor,
+        "nit":          nit,
+        "fecha":        fecha,
+        "subtotal":     subtotal,
+        "iva":          iva,
+        "total":        total,
+        "tipo_factura": tipo,
+        "cuenta_puc":   puc_cod,
+        "nombre_puc":   puc_nom,
+        "timestamp":    str(datetime.now().date()),
     }
 
 # ─── WhatsApp helpers ─────────────────────────────────────────────────────────
@@ -1344,14 +1459,15 @@ async def _procesar_factura(numero: str, texto_pdf: str):
             )
 
         msg = (
-            f"🧾 *Factura detectada y registrada:*\n\n"
+            f"🧾 *Factura detectada:* {datos['tipo_factura']}\n\n"
             f"🏢 Emisor: {datos['emisor']}\n"
             f"🔢 NIT: {datos['nit']}\n"
-            f"📅 Fecha: {datos['fecha']}\n"
-            f"💵 Valor: {fmt_cop(datos['subtotal'])}\n"
+            f"📅 Vence: {datos['fecha']}\n"
+            f"💵 Subtotal: {fmt_cop(datos['subtotal'])}\n"
             f"🧮 IVA: {fmt_cop(datos['iva'])}\n"
-            f"💰 Total: {fmt_cop(datos['total'])}\n\n"
-            f"Agregada a cuentas por pagar ✅\n"
+            f"💰 Total: {fmt_cop(datos['total'])}\n"
+            f"📊 Cuenta PUC sugerida: {datos['cuenta_puc']} - {datos['nombre_puc']}\n\n"
+            f"✅ Agregada a cuentas por pagar\n"
             f"Escribe *facturas* para ver todas"
         )
         enviar_whatsapp(numero, msg)
