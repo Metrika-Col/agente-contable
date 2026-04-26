@@ -2,7 +2,7 @@
 Agente Auxiliar Contable — Metrika Group
 FastAPI + Twilio WhatsApp + openpyxl
 """
-import os, io, re, logging, math
+import os, io, re, logging, math, time
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -22,12 +22,22 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agente_contable")
 
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WA_NUMBER   = os.getenv("TWILIO_WA_NUMBER", "whatsapp:+14155238886")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+if GEMINI_API_KEY:
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    _gemini = genai.GenerativeModel("gemini-2.0-flash-lite")
+else:
+    _gemini = None
+
+_GEMINI_SYSTEM = "Eres CONTA, auxiliar contable de Metrika Group. Responde en español, máximo 800 caracteres, conciso y directo."
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
 
@@ -779,7 +789,7 @@ _MSG_SIN_EXTRACTO = (
     "poder responder esa consulta."
 )
 
-def responder_sin_ia(mensaje: str, sesion: "SesionExtracto | None") -> str:
+def _buscar_patron(mensaje: str, sesion: "SesionExtracto | None") -> "Optional[str]":
     msg = mensaje.lower()
 
     # 1. Identidad
@@ -965,19 +975,63 @@ def responder_sin_ia(mensaje: str, sesion: "SesionExtracto | None") -> str:
             lineas.append(f"{signo} {m['concepto'][:35]} | {fmt_cop(abs(val))}")
         return f"📅 *Movimientos del {dia} de {nombre_mes.capitalize()}*\n\n" + "\n".join(lineas)
 
-    # 11. Fallbacks
+    # Sin patrón reconocido — señal para intentar IA
     if not sesion or not sesion.mov_banco:
         return _MSG_SIN_EXTRACTO
 
-    return (
-        "No entendí tu consulta. Puedes preguntarme sobre:\n"
-        "- Saldos: 'saldo en enero'\n"
-        "- Gastos: 'cuánto gasté en febrero'\n"
-        "- Ingresos: 'ingresos de marzo'\n"
-        "- Nómina: 'pagos de nómina'\n"
-        "- Irregulares: 'movimientos inusuales'\n"
-        "- Ayuda: 'qué puedes hacer'"
+    return None
+
+
+def _consultar_gemini(mensaje: str, sesion: "SesionExtracto") -> str:
+    if not _gemini:
+        raise RuntimeError("Gemini no configurado")
+    r    = sesion.resumen
+    top5 = r.get("top10", [])[:5]
+    lineas_top = "\n".join(
+        f"  {m['fecha']} | {m['concepto'][:35]} | "
+        f"{fmt_cop(m['credito'] if m['credito'] > 0 else m['debito'])} | "
+        f"{'Abono' if m['credito'] > 0 else 'Cargo'}"
+        for m in top5
     )
+    contexto = (
+        f"EXTRACTO ({r.get('total_tx', 0)} transacciones):\n"
+        f"Ingresos: {fmt_cop(r.get('ingresos', 0))} | "
+        f"Egresos: {fmt_cop(r.get('egresos', 0))} | "
+        f"Saldo: {fmt_cop(r.get('saldo', 0))}\n\n"
+        f"TOP 5:\n{lineas_top}"
+    )[:500]
+    prompt = f"{_GEMINI_SYSTEM}\n\n{contexto}\n\nUsuario: {mensaje}"
+    try:
+        resp = _gemini.generate_content(prompt)
+    except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower():
+            log.warning("[Gemini] 429 quota — reintentando en 20s")
+            time.sleep(20)
+            resp = _gemini.generate_content(prompt)
+        else:
+            raise
+    texto = resp.text
+    if len(texto) > 1500:
+        texto = texto[:1450] + "...\n_(Respuesta truncada)_"
+    return texto
+
+
+def responder_sin_ia(mensaje: str, sesion: "SesionExtracto | None") -> str:
+    # 1. Patrones (gratis, instantáneo)
+    respuesta_patron = _buscar_patron(mensaje, sesion)
+    if respuesta_patron is not None:
+        return respuesta_patron
+
+    # 2. IA como fallback si hay key y sesión activa
+    if GEMINI_API_KEY and sesion:
+        try:
+            return _consultar_gemini(mensaje, sesion)
+        except Exception as e:
+            log.warning(f"[Gemini] fallo — {type(e).__name__}: {e}")
+
+    # 3. Fallback sin IA
+    return "No entendí. Consulta: saldo / ingresos / gastos / nómina / inusuales / ayuda"
+
 
 # ─── Endpoints HTTP ───────────────────────────────────────────────────────────
 
