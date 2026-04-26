@@ -681,34 +681,96 @@ def _es_factura(texto: str) -> bool:
     tiene_iva      = bool(re.search(r'\biva\b', t))
     return tiene_nit and (tiene_subtotal or tiene_iva)
 
+def _parse_valor_factura(s: str) -> float:
+    """Parse Colombian invoice monetary value.
+    Handles: 110.642 · 110,642 · 1.110.642 · 110.642,00 · 110,642.00
+    """
+    s = s.strip().replace("$", "").replace("\xa0", "").replace(" ", "")
+    if not s:
+        return 0.0
+    ndots   = s.count(".")
+    ncommas = s.count(",")
+    if ndots > 1:                               # 1.110.642[,00]
+        s = s.replace(".", "").replace(",", ".")
+    elif ncommas > 1:                           # 1,110,642
+        s = s.replace(",", "")
+    elif ndots == 1 and ncommas == 1:
+        if s.index(".") < s.index(","):         # 110.642,00 → col
+            s = s.replace(".", "").replace(",", ".")
+        else:                                   # 110,642.00 → US
+            s = s.replace(",", "")
+    elif ndots == 1:
+        if len(s.split(".")[1]) == 3:           # 110.642 → miles
+            s = s.replace(".", "")
+        # else: decimal → leave as is
+    elif ncommas == 1:
+        if len(s.split(",")[1]) == 3:           # 110,642 → miles
+            s = s.replace(",", "")
+        else:                                   # 110,64 → decimal
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+# Etiquetas de datos del receptor/cliente que no son el emisor
+_RX_ETIQUETA_RECEPTOR = re.compile(
+    r'^(Nom|Tele|Tel|Dire|Dir|Ciud|Iden|Fact|Correo|Email|Ciudad|Barrio|Dpto)\s*:',
+    re.IGNORECASE
+)
+
+
 def _extraer_datos_factura(texto: str) -> dict:
     t = texto
 
     # ── EMISOR (cascada) ─────────────────────────────────────────────────────
     emisor = None
-    for pat, grp, flags in [
-        (r"Nombre\s+Raz[oó]n\s+Social\s+Emisor[:\s]*(.*?)(?:[,\n])", 1, re.IGNORECASE),
-        (r"^(.+?)\s+NIT",                                              1, re.IGNORECASE | re.MULTILINE),
-        (r"Raz[oó]n\s+Social[:\s]*(.*?)(?:\n|$)",                     1, re.IGNORECASE),
-        (r"Empresa[:\s]*(.*?)(?:\n|$)",                                1, re.IGNORECASE),
-    ]:
-        m = re.search(pat, t, flags)
-        if m:
-            emisor = m.group(grp).strip()
-            break
-    if not emisor:
-        lineas = [l.strip() for l in t.split('\n') if l.strip()]
-        emisor = lineas[0] if lineas else "No detectado"
-    emisor = emisor[:50]
-
-    # ── NIT (cascada) ────────────────────────────────────────────────────────
-    nit = None
-    m = re.search(r"\d{3}\.?\d{3}\.?\d{3}-?\d", t)
+    # 1. Campo explícito de factura electrónica
+    m = re.search(r"Nombre\s+Raz[oó]n\s+Social\s+Emisor[:\s]*(.*?)(?:[,\n])", t, re.IGNORECASE)
     if m:
-        nit = m.group(0)
+        emisor = m.group(1).strip()
+    # 2. Línea que contiene "NIT", excluyendo filas de datos del receptor
+    if not emisor:
+        for linea in t.split('\n'):
+            ls = linea.strip()
+            if not ls or _RX_ETIQUETA_RECEPTOR.match(ls):
+                continue
+            if re.search(r'\bNIT\b', ls, re.IGNORECASE):
+                mx = re.match(r'^(.+?)\s+NIT', ls, re.IGNORECASE)
+                if mx:
+                    emisor = mx.group(1).strip()
+                    break
+    # 3-4. Campos estructurados
+    if not emisor:
+        m = re.search(r"Raz[oó]n\s+Social[:\s]*(.*?)(?:\n|$)", t, re.IGNORECASE)
+        if m: emisor = m.group(1).strip()
+    if not emisor:
+        m = re.search(r"Empresa[:\s]*(.*?)(?:\n|$)", t, re.IGNORECASE)
+        if m: emisor = m.group(1).strip()
+    # 5. Fallback: primera línea no vacía que no sea etiqueta de receptor
+    if not emisor:
+        for linea in t.split('\n'):
+            ls = linea.strip()
+            if ls and not _RX_ETIQUETA_RECEPTOR.match(ls):
+                emisor = ls
+                break
+    emisor = (emisor or "No detectado")[:50]
+
+    # ── NIT (cascada — guión obligatorio para descartar teléfonos) ───────────
+    nit = None
+    # 1. "NIT NNN.NNN.NNN-N" — formato con guión requerido
+    m = re.search(r'\bNIT\s+(\d{3}\.?\d{3}\.?\d{3}-\d)', t, re.IGNORECASE)
+    if m: nit = m.group(1)
+    # 2. "NIT: NNN.NNN.NNN-N"
     if not nit:
-        m = re.search(r"NIT[:\s]+(\d[\d\.]+\-?\d)", t, re.IGNORECASE)
-        if m: nit = m.group(1).strip()
+        m = re.search(r'\bNIT[:\s]+(\d{3}\.?\d{3}\.?\d{3}-\d)', t, re.IGNORECASE)
+        if m: nit = m.group(1)
+    # 3. Formato con puntos explícitos NNN.NNN.NNN-N en cualquier parte
+    if not nit:
+        m = re.search(r'\b(\d{3}\.\d{3}\.\d{3}-\d)\b', t)
+        if m: nit = m.group(1)
+    # 4. "Nit o CC.:" — puede ser número de cliente, último recurso
     if not nit:
         m = re.search(r"Nit\s+o\s+CC\.?:?\s*([\d\.]+)", t, re.IGNORECASE)
         if m: nit = m.group(1).strip()
@@ -729,49 +791,52 @@ def _extraer_datos_factura(texto: str) -> dict:
             break
     fecha = fecha or str(date.today())
 
-    # ── TOTAL (cascada, luego mayor valor del documento) ─────────────────────
+    # ── TOTAL (cascada + _parse_valor_factura) ───────────────────────────────
+    _NUM = r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)"
     total = 0.0
     for pat in [
-        r"[Tt]otal\s+a\s+pagar[^\n$]*\$?\s*([\d,\.]+)",
-        r"TOTAL\s+A\s+PAGAR[^\n$]*\$?\s*([\d,\.]+)",
-        r"[Tt]otal[^\n$]*\$?\s*([\d,\.]+)",
-        r"[Vv]alor\s+total[^\n$]*\$?\s*([\d,\.]+)",
-        r"[Tt]otal\s+factura[^\n$]*\$?\s*([\d,\.]+)",
+        rf"[Tt]otal\s+a\s+pagar[^\d\n]*{_NUM}",
+        rf"TOTAL\s+A\s+PAGAR[^\d\n]*{_NUM}",
+        rf"[Tt]otal\s+a\s+cancelar[^\d\n]*{_NUM}",
+        rf"[Vv]alor\s+total[^\d\n]*{_NUM}",
+        rf"[Tt]otal\s+factura[^\d\n]*{_NUM}",
+        rf"\bTOTAL\b[^\d\n]*{_NUM}",
     ]:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
-            v = _parse_valor_co(m.group(1))
+            v = _parse_valor_factura(m.group(1))
             if v > 0:
                 total = v
                 break
+    # Fallback: mayor valor precedido por $ en el documento
     if total == 0.0:
-        candidatos = re.findall(r'\$?\s*(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?)', t)
-        valores = [_parse_valor_co(c) for c in candidatos if _parse_valor_co(c) > 0]
+        candidatos = re.findall(rf'\$\s*{_NUM}', t)
+        valores = [_parse_valor_factura(c) for c in candidatos if _parse_valor_factura(c) > 0]
         if valores:
             total = max(valores)
 
-    # ── IVA (cascada) ────────────────────────────────────────────────────────
+    # ── IVA ──────────────────────────────────────────────────────────────────
     iva = 0.0
     for pat in [
-        r"IVA[^\n$]*\$?\s*([\d,\.]+)",
-        r"[Ii]mpuesto[^\n$]*\$?\s*([\d,\.]+)",
+        rf"\bIVA\b[^\d\n]*{_NUM}",
+        rf"[Ii]mpuesto[^\d\n]*{_NUM}",
     ]:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
-            v = _parse_valor_co(m.group(1))
+            v = _parse_valor_factura(m.group(1))
             if v > 0:
                 iva = v
                 break
 
-    # ── SUBTOTAL (cascada) ───────────────────────────────────────────────────
+    # ── SUBTOTAL ─────────────────────────────────────────────────────────────
     subtotal = 0.0
     for pat in [
-        r"[Ss]ubtotal[^\n$]*\$?\s*([\d,\.]+)",
-        r"[Ss]ub\s+total[^\n$]*\$?\s*([\d,\.]+)",
+        rf"[Ss]ubtotal[^\d\n]*{_NUM}",
+        rf"[Ss]ub\s+total[^\d\n]*{_NUM}",
     ]:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
-            v = _parse_valor_co(m.group(1))
+            v = _parse_valor_factura(m.group(1))
             if v > 0:
                 subtotal = v
                 break
