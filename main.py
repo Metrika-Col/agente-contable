@@ -1,8 +1,8 @@
 """
 Agente Auxiliar Contable — Metrika Group
-FastAPI + Claude API + Twilio WhatsApp + openpyxl
+FastAPI + Twilio WhatsApp + openpyxl
 """
-import os, io, re, logging, math, time
+import os, io, re, logging, math
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -10,7 +10,6 @@ from typing import Optional
 import httpx
 import pdfplumber
 import openpyxl
-import google.generativeai as genai
 from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
 from openpyxl.utils import get_column_letter
 
@@ -22,20 +21,15 @@ from twilio.rest import Client as TwilioClient
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agente_contable")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WA_NUMBER   = os.getenv("TWILIO_WA_NUMBER", "whatsapp:+14155238886")
 
-claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-twilio  = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-genai.configure(api_key=GEMINI_API_KEY)
-gemini  = genai.GenerativeModel("gemini-2.0-flash-lite")
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = FastAPI(title="Agente Auxiliar Contable", version="1.0.0")
-
-SYSTEM_PROMPT = "Eres CONTA, auxiliar contable. Responde en español, máximo 800 caracteres, conciso. Si necesitas más espacio, ofrece responder por partes."
 
 # ─── Sesiones por número de teléfono (TTL 24 h) ──────────────────────────────
 from dataclasses import dataclass, field as dc_field
@@ -45,7 +39,8 @@ class SesionExtracto:
     mov_banco:    list[dict]
     resumen:      dict
     clasificados: list[dict]
-    timestamp:    datetime = dc_field(default_factory=datetime.now)
+    facturas:     list[dict] = dc_field(default_factory=list)
+    timestamp:    datetime   = dc_field(default_factory=datetime.now)
 
 SESIONES: dict[str, SesionExtracto] = {}
 SESION_TTL_HORAS = 24
@@ -255,11 +250,6 @@ def _parse_valor_co(s: str) -> float:
 # ─── Conciliación: solo datos reales del banco ───────────────────────────────
 
 def conciliar(mov_banco: list[dict]) -> dict:
-    """
-    Clasifica y agrupa los movimientos reales del banco por cuenta PUC.
-    Sin registros contables propios del usuario: no hay cruce inventado.
-    Para conciliación completa, el usuario debe importar sus registros de OSSADO.
-    """
     if mov_banco and "cuenta_puc" not in mov_banco[0]:
         mov_banco = clasificar_con_reglas_locales(mov_banco)
 
@@ -280,7 +270,6 @@ def conciliar(mov_banco: list[dict]) -> dict:
         "clasificados":   clasificados,
         "sin_clasificar": sin_clasificar,
         "top_egresos":    top_egresos,
-        # Claves de compatibilidad con la interfaz web
         "conciliados": clasificados,
         "solo_banco":  sin_clasificar,
         "solo_conta":  [],
@@ -291,7 +280,6 @@ def conciliar(mov_banco: list[dict]) -> dict:
             "debitos_banco":        total_db,
             "creditos_banco":       total_cr,
             "saldo_neto":           total_cr - total_db,
-            # Legacy keys
             "total_conciliados":    len(clasificados),
             "total_solo_banco":     len(sin_clasificar),
             "total_solo_conta":     0,
@@ -307,11 +295,9 @@ _MESES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
           "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 
 def _calendario_dian_proximas() -> list[dict]:
-    """Próximas obligaciones DIAN colombianas calculadas desde date.today()."""
     hoy = date.today()
     obligaciones: list[dict] = []
 
-    # Retención en la fuente: mensual, vence día 12 del mes siguiente
     for delta in range(4):
         mes_venc = hoy.month + delta
         anio_venc = hoy.year + (mes_venc - 1) // 12
@@ -330,8 +316,6 @@ def _calendario_dian_proximas() -> list[dict]:
             "vencimiento": str(venc),
         })
 
-    # IVA bimestral: vence día 12 del mes siguiente al bimestre
-    # Bimestres: (mes_inicio, mes_fin, mes_vencimiento)
     for m1, m2, m_venc in [(1,2,3),(3,4,5),(5,6,7),(7,8,9),(9,10,11),(11,12,1)]:
         anio_venc = hoy.year + (1 if m_venc < m1 else 0)
         try:
@@ -347,7 +331,6 @@ def _calendario_dian_proximas() -> list[dict]:
             "vencimiento": str(venc),
         })
 
-    # ICA Barranquilla: trimestral, vence día 20 del mes siguiente
     for m_ini, m_fin, m_venc in [(1,3,4),(4,6,7),(7,9,10),(10,12,1)]:
         anio_venc = hoy.year + (1 if m_venc < m_ini else 0)
         try:
@@ -413,7 +396,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     top_egresos  = resultado.get("top_egresos", [])
     res          = resultado["resumen"]
 
-    # ── Hoja 1: Movimientos clasificados ─────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Clasificados PUC"
     escribir_encabezado(ws1, "MOVIMIENTOS CLASIFICADOS POR PUC",
@@ -449,7 +431,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     widths1 = [12, 45, 14, 14, 14, 12, 28]
     for j, w in enumerate(widths1, 1): fmt_col(ws1, j, w)
 
-    # ── Hoja 2: Sin clasificar ────────────────────────────────────────────────
     ws2 = wb.create_sheet("Sin Clasificar")
     escribir_encabezado(ws2, "MOVIMIENTOS SIN CUENTA PUC",
                         "Requieren revisión manual — asignar cuenta contable")
@@ -488,7 +469,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     widths2 = [12, 45, 14, 14, 14, 10, 35]
     for j, w in enumerate(widths2, 1): fmt_col(ws2, j, w)
 
-    # ── Hoja 3: Top Egresos ───────────────────────────────────────────────────
     ws3 = wb.create_sheet("Top Egresos")
     escribir_encabezado(ws3, "TOP EGRESOS DEL PERÍODO",
                         f"Corte: {date.today().strftime('%d/%m/%Y')}")
@@ -530,7 +510,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     tc3.alignment = Alignment(horizontal="right")
     tc3.border = border_thin()
 
-    # ── Hoja 4: Calendario DIAN ───────────────────────────────────────────────
     ws4 = wb.create_sheet("Calendario DIAN")
     escribir_encabezado(ws4, "PRÓXIMAS OBLIGACIONES FISCALES",
                         f"Calculado desde {date.today().strftime('%d/%m/%Y')} — verificar NIT en DIAN")
@@ -556,14 +535,12 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
                 cell.alignment = Alignment(horizontal="center")
     widths4 = [28, 20, 18, 15, 12]
     for j, w in enumerate(widths4, 1): fmt_col(ws4, j, w)
-    # Nota al pie
     last4 = 5 + len(_calendario_dian_proximas())
     nota4 = ws4.cell(row=last4+2, column=1,
         value="* Fechas basadas en calendario general colombiano. Confirmar según dígito verificador del NIT.")
     nota4.font = Font(italic=True, size=8, color="888888", name="Calibri")
     ws4.merge_cells(f"A{last4+2}:E{last4+2}")
 
-    # ── Hoja 5: Resumen Ejecutivo ─────────────────────────────────────────────
     ws5 = wb.create_sheet("Resumen Ejecutivo")
     ws5.sheet_view.showGridLines = False
     escribir_encabezado(ws5, "RESUMEN EJECUTIVO",
@@ -607,7 +584,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     fmt_col(ws5, 3, 5)
     fmt_col(ws5, 4, 18)
 
-    # ── Hoja 6: Movimientos — extracto completo ──────────────────────────────
     ws6 = wb.create_sheet("Movimientos")
     escribir_encabezado(ws6, "EXTRACTO COMPLETO — TODOS LOS MOVIMIENTOS",
                         f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
@@ -620,7 +596,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border_thin()
     ws6.row_dimensions[5].height = 28
-    # Combinar clasificados + sin_clasificar y ordenar por fecha
     todos_movs = sorted(
         clasificados + sin_clasi,
         key=lambda m: m.get("fecha") or ""
@@ -654,7 +629,6 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
         ws6.row_dimensions[i].height = max(18, lineas6 * 15)
     widths6 = [12, 45, 16, 16]
     for j, w in enumerate(widths6, 1): fmt_col(ws6, j, w)
-    # ── Fila de totales ──
     saldo_neto = total_abonos - total_cargos
     last6 = 5 + len(todos_movs)
     totales6 = [
@@ -679,38 +653,59 @@ def generar_excel_conciliacion(resultado: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# ─── Claude + Twilio ──────────────────────────────────────────────────────────
+# ─── Detección y extracción de facturas ───────────────────────────────────────
 
-_WA_MAX = 1500
+def _extraer_texto_pdf(pdf_bytes: bytes) -> str:
+    texto = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            texto += (page.extract_text() or "") + "\n"
+    return texto
+
+def _es_factura(texto: str) -> bool:
+    t = texto.lower()
+    if "factura" in t or "invoice" in t:
+        return True
+    tiene_nit      = "nit" in t
+    tiene_subtotal = "subtotal" in t
+    tiene_iva      = bool(re.search(r'\biva\b', t))
+    return tiene_nit and (tiene_subtotal or tiene_iva)
+
+def _extraer_datos_factura(texto: str) -> dict:
+    nit_m = re.search(r'NIT[\s.:]*(\d[\d.\-]+)', texto, re.IGNORECASE)
+    nit   = nit_m.group(1).strip() if nit_m else "No detectado"
+
+    fecha_m = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', texto)
+    fecha   = fecha_m.group(0) if fecha_m else "No detectada"
+
+    iva_m = re.search(r'IVA[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
+    iva   = _parse_valor_co(iva_m.group(1)) if iva_m else 0.0
+
+    total_m = re.search(r'TOTAL[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
+    total   = _parse_valor_co(total_m.group(1)) if total_m else 0.0
+
+    subtotal_m = re.search(r'SUBTOTAL[\s:$]*\s*([\d.,]+)', texto, re.IGNORECASE)
+    subtotal   = _parse_valor_co(subtotal_m.group(1)) if subtotal_m else max(0.0, total - iva)
+
+    lineas = [l.strip() for l in texto.split('\n') if l.strip()]
+    emisor = lineas[0][:50] if lineas else "No detectado"
+
+    return {
+        "emisor":    emisor,
+        "nit":       nit,
+        "fecha":     fecha,
+        "subtotal":  subtotal,
+        "iva":       iva,
+        "total":     total,
+        "timestamp": str(datetime.now().date()),
+    }
+
+# ─── WhatsApp helpers ─────────────────────────────────────────────────────────
+
+_WA_MAX  = 1500
 _WA_TRUNC = 1450
 
-def consultar_agente(mensaje: str, contexto_extra: str = "") -> str:
-    if contexto_extra and len(contexto_extra) > 500:
-        contexto_extra = contexto_extra[:500]
-    prompt = f"{SYSTEM_PROMPT}\n\n"
-    if contexto_extra:
-        prompt += f"{contexto_extra}\n\n"
-    prompt += f"Usuario: {mensaje}"
-    try:
-        try:
-            response = gemini.generate_content(prompt)
-        except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
-                log.warning(f"[consultar_agente] 429 quota — reintentando en 20s")
-                time.sleep(20)
-                response = gemini.generate_content(prompt)
-            else:
-                raise
-        texto = response.text
-        if len(texto) > _WA_MAX:
-            texto = texto[:_WA_TRUNC] + "...\n\n_(Respuesta truncada. Pregunta más específico)_"
-        return texto
-    except Exception as e:
-        log.error(f"[consultar_agente] Gemini error — {type(e).__name__}: {e}", exc_info=True)
-        return f"❌ Error al consultar el asistente: {type(e).__name__}: {e}"
-
 def _partir_mensaje(texto: str, max_chars: int = _WA_MAX) -> list[str]:
-    """Divide texto en partes de max_chars sin cortar palabras."""
     if len(texto) <= max_chars:
         return [texto]
     partes = []
@@ -754,6 +749,235 @@ def subir_excel_twilio(excel_bytes: bytes, filename: str) -> str:
     url = f"{base}/descargar/{filename}"
     log.info(f"URL de descarga generada: {url}")
     return url
+
+# ─── Sistema de respuestas sin IA ────────────────────────────────────────────
+
+_MESES_NOMBRES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
+}
+
+_MSG_IDENTIDAD = (
+    "🤖 Soy *CONTA*, tu Auxiliar Contable IA de Metrika Group.\n\n"
+    "Puedo ayudarte con:\n"
+    "📄 Procesar tu extracto bancario (envíame el PDF)\n"
+    "💰 Consultar saldos por período\n"
+    "📊 Ver ingresos y egresos\n"
+    "🔍 Detectar movimientos inusuales\n"
+    "🧾 Procesar facturas\n"
+    "📅 Calendario fiscal DIAN\n\n"
+    "Comandos rápidos:\n"
+    "- *saldo* → resumen general\n"
+    "- *clasificar* → top 10 con PUC\n"
+    "- *impuestos* → fechas DIAN\n"
+    "- *pagos pendientes* → principales egresos"
+)
+
+_MSG_SIN_EXTRACTO = (
+    "📄 Primero envíame tu extracto bancario en PDF para "
+    "poder responder esa consulta."
+)
+
+def responder_sin_ia(mensaje: str, sesion: "SesionExtracto | None") -> str:
+    msg = mensaje.lower()
+
+    # 1. Identidad
+    if any(k in msg for k in ["qué eres", "que eres", "quién eres", "quien eres",
+                               "qué puedes", "que puedes", "ayuda", "help",
+                               "comandos", "cómo funciona", "como funciona",
+                               "hola", "buenas", "buenos", "menu", "menú"]):
+        return _MSG_IDENTIDAD
+
+    # Detectar mes mencionado
+    mes_detectado = None
+    for nombre_mes, num_mes in _MESES_NOMBRES.items():
+        if nombre_mes in msg:
+            mes_detectado = (nombre_mes, num_mes)
+            break
+
+    # 2. Saldo por mes
+    if mes_detectado and any(k in msg for k in ["saldo", "balance", "resumen"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        nombre_mes, num_mes = mes_detectado
+        movs_mes = [m for m in sesion.mov_banco
+                    if re.match(rf"\d{{4}}-{num_mes:02d}-", m.get("fecha", ""))]
+        if not movs_mes:
+            return f"ℹ️ No encontré movimientos de {nombre_mes.capitalize()} en el extracto cargado."
+        ing_mes = sum(m["credito"] for m in movs_mes)
+        eg_mes  = sum(m["debito"]  for m in movs_mes)
+        saldo_i = movs_mes[0].get("saldo") or 0
+        saldo_f = movs_mes[-1].get("saldo") or 0
+        return (
+            f"💰 *Saldo de {nombre_mes.capitalize()}*\n\n"
+            f"📋 Transacciones: {len(movs_mes)}\n"
+            f"💚 Ingresos: {fmt_cop(ing_mes)}\n"
+            f"🔴 Egresos: {fmt_cop(eg_mes)}\n"
+            f"📈 Saldo neto: {fmt_cop(ing_mes - eg_mes)}\n"
+            f"🏦 Saldo inicial: {fmt_cop(saldo_i)}\n"
+            f"🏦 Saldo final: {fmt_cop(saldo_f)}"
+        )
+
+    # 3. Saldo general
+    if "saldo" in msg:
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        r = sesion.resumen
+        return (
+            f"💰 *Saldo del extracto*\n\n"
+            f"💚 Ingresos: {fmt_cop(r['ingresos'])}\n"
+            f"🔴 Egresos:  {fmt_cop(r['egresos'])}\n"
+            f"💰 Saldo neto: {fmt_cop(r['saldo'])}\n\n"
+            f"📋 {r['total_tx']} transacciones en el período"
+        )
+
+    # 4. Ingresos
+    if any(k in msg for k in ["ingreso", "entró", "entro", "abono", "recibí", "recibi"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        movs = sesion.mov_banco
+        if mes_detectado:
+            _, num_mes = mes_detectado
+            movs = [m for m in movs if re.match(rf"\d{{4}}-{num_mes:02d}-", m.get("fecha", ""))]
+        top5 = sorted([m for m in movs if m["credito"] > 0],
+                      key=lambda m: m["credito"], reverse=True)[:5]
+        if not top5:
+            return "ℹ️ No encontré ingresos en el período consultado."
+        periodo_txt = f" de {mes_detectado[0].capitalize()}" if mes_detectado else ""
+        lineas = "\n".join(
+            f"💚 {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(m['credito'])}"
+            for m in top5
+        )
+        return f"💚 *Top 5 Ingresos{periodo_txt}*\n\n{lineas}"
+
+    # 5. Egresos
+    if any(k in msg for k in ["egreso", "gasto", "salió", "salio", "pagué", "pague",
+                               "gasté", "gaste", "cuánto", "cuanto"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        movs = sesion.mov_banco
+        if mes_detectado:
+            _, num_mes = mes_detectado
+            movs = [m for m in movs if re.match(rf"\d{{4}}-{num_mes:02d}-", m.get("fecha", ""))]
+        top5 = sorted([m for m in movs if m["debito"] > 0],
+                      key=lambda m: m["debito"], reverse=True)[:5]
+        if not top5:
+            return "ℹ️ No encontré egresos en el período consultado."
+        periodo_txt = f" de {mes_detectado[0].capitalize()}" if mes_detectado else ""
+        lineas = "\n".join(
+            f"🔴 {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(m['debito'])}"
+            for m in top5
+        )
+        return f"🔴 *Top 5 Egresos{periodo_txt}*\n\n{lineas}"
+
+    # 6. Movimientos inusuales
+    if any(k in msg for k in ["irregular", "inusual", "raro", "anormal", "sospechoso", "alerta"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        egresos_vals = [m["debito"] for m in sesion.mov_banco if m["debito"] > 0]
+        if not egresos_vals:
+            return "ℹ️ No encontré egresos en el extracto."
+        promedio = sum(egresos_vals) / len(egresos_vals)
+        umbral   = promedio * 3
+        inusuales = sorted(
+            [m for m in sesion.mov_banco if m["debito"] > umbral],
+            key=lambda m: m["debito"], reverse=True
+        )
+        if not inusuales:
+            return f"✅ No hay movimientos inusuales.\nPromedio de egresos: {fmt_cop(promedio)}"
+        lineas = "\n".join(
+            f"⚠️ {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(m['debito'])}"
+            for m in inusuales[:5]
+        )
+        return (
+            f"🔍 *Movimientos Inusuales* (>3x promedio)\n"
+            f"Promedio egreso: {fmt_cop(promedio)}\n"
+            f"Umbral: {fmt_cop(umbral)}\n\n{lineas}"
+        )
+
+    # 7. Últimos movimientos
+    if any(k in msg for k in ["último", "ultimo", "reciente", "últimas", "ultimas"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        ultimos = sesion.mov_banco[-5:][::-1]
+        lineas = []
+        for m in ultimos:
+            val   = m["credito"] if m["credito"] > 0 else -m["debito"]
+            signo = "💚" if val > 0 else "🔴"
+            lineas.append(f"{signo} {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(abs(val))}")
+        return "📋 *Últimas 5 Transacciones*\n\n" + "\n".join(lineas)
+
+    # 8. Nómina
+    if any(k in msg for k in ["nómina", "nomina", "salario", "hada"]):
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        nomina_movs = [m for m in sesion.mov_banco if "nomi" in m.get("concepto", "").lower()]
+        if not nomina_movs:
+            return "ℹ️ No encontré pagos de nómina (con 'NOMI' en descripción) en el extracto."
+        total_nom = sum(m["debito"] for m in nomina_movs)
+        lineas = "\n".join(
+            f"👥 {m['fecha']} | {m['concepto'][:35]} | {fmt_cop(m['debito'])}"
+            for m in nomina_movs
+        )
+        return f"👥 *Pagos de Nómina*\n\n{lineas}\n\n💰 Total: {fmt_cop(total_nom)}"
+
+    # 9. Transferencias Nequi
+    if "nequi" in msg:
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        nequi_movs = [m for m in sesion.mov_banco
+                      if "nequi" in m.get("concepto", "").lower()]
+        if not nequi_movs:
+            return "ℹ️ No encontré transferencias a Nequi en el extracto."
+        total_nequi = sum(m["debito"] + m["credito"] for m in nequi_movs)
+        n = len(nequi_movs)
+        return (
+            f"📱 *Transferencias Nequi*\n\n"
+            f"Cantidad: {n} transferencia{'s' if n != 1 else ''}\n"
+            f"Total: {fmt_cop(total_nequi)}"
+        )
+
+    # 10. Día específico
+    meses_rx = "|".join(_MESES_NOMBRES.keys())
+    rx_dia = re.search(rf"(\d{{1,2}})\s+de\s+({meses_rx})", msg)
+    if rx_dia:
+        if not sesion or not sesion.mov_banco:
+            return _MSG_SIN_EXTRACTO
+        dia        = int(rx_dia.group(1))
+        nombre_mes = rx_dia.group(2)
+        num_mes    = _MESES_NOMBRES[nombre_mes]
+        anio       = datetime.now().year
+        primera    = sesion.mov_banco[0].get("fecha", "")
+        if primera:
+            try:
+                anio = int(primera[:4])
+            except ValueError:
+                pass
+        fecha_buscar = f"{anio}-{num_mes:02d}-{dia:02d}"
+        movs_dia = [m for m in sesion.mov_banco if m.get("fecha", "") == fecha_buscar]
+        if not movs_dia:
+            return f"ℹ️ No encontré transacciones el {dia} de {nombre_mes}."
+        lineas = []
+        for m in movs_dia:
+            val   = m["credito"] if m["credito"] > 0 else -m["debito"]
+            signo = "💚" if val > 0 else "🔴"
+            lineas.append(f"{signo} {m['concepto'][:35]} | {fmt_cop(abs(val))}")
+        return f"📅 *Movimientos del {dia} de {nombre_mes.capitalize()}*\n\n" + "\n".join(lineas)
+
+    # 11. Fallbacks
+    if not sesion or not sesion.mov_banco:
+        return _MSG_SIN_EXTRACTO
+
+    return (
+        "No entendí tu consulta. Puedes preguntarme sobre:\n"
+        "- Saldos: 'saldo en enero'\n"
+        "- Gastos: 'cuánto gasté en febrero'\n"
+        "- Ingresos: 'ingresos de marzo'\n"
+        "- Nómina: 'pagos de nómina'\n"
+        "- Irregulares: 'movimientos inusuales'\n"
+        "- Ayuda: 'qué puedes hacer'"
+    )
 
 # ─── Endpoints HTTP ───────────────────────────────────────────────────────────
 
@@ -826,13 +1050,12 @@ _MSG_SIN_PDF = "⚠️ Primero envíame el PDF de tu extracto bancario para come
 
 @app.post("/enviar-resumen-wa")
 async def enviar_resumen_wa(request: Request):
-    """Envía el resumen del reporte ejecutivo al número WhatsApp indicado."""
     body = await request.json()
     numero = str(body.get("numero", "")).replace("whatsapp:", "").strip()
     if not numero:
         raise HTTPException(400, "El campo 'numero' es requerido (ej. +573001234567)")
 
-    resumen  = body.get("resumen", {})
+    resumen   = body.get("resumen", {})
     anomalias = body.get("anomalias")
 
     total_ingresos = resumen.get("totalIngresos", 0)
@@ -886,12 +1109,12 @@ async def webhook_whatsapp(
     mensaje = Body.strip().lower()
     log.info(f"WA {numero}: '{Body[:80]}'")
 
-    # ── PDF adjunto → procesar y guardar sesión ──────────────────────────────
+    # ── PDF adjunto → detectar extracto o factura ────────────────────────────
     if int(NumMedia) > 0 and "pdf" in MediaContentType0.lower():
         log.info(f"WA {numero}: rama=PDF")
         background_tasks.add_task(procesar_extracto_pdf, numero, MediaUrl0)
         enviar_whatsapp(numero,
-            "📄 Recibí tu extracto. Procesando... en unos segundos te envío el resumen.")
+            "📄 Recibí tu PDF. Procesando... en unos segundos te envío el resultado.")
         return {"status": "procesando"}
 
     sesion: SesionExtracto | None = SESIONES.get(numero)
@@ -899,14 +1122,14 @@ async def webhook_whatsapp(
     # ── Comando: clasificar ──────────────────────────────────────────────────
     if "clasificar" in mensaje:
         log.info(f"WA {numero}: rama=clasificar")
-        if not sesion:
+        if not sesion or not sesion.mov_banco:
             enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
         top10 = sesion.resumen["top10"][:10]
         lineas = []
         for m in top10:
-            val  = m["credito"] if m["credito"] > 0 else -m["debito"]
-            puc  = m.get("cuenta_puc") or "—"
+            val   = m["credito"] if m["credito"] > 0 else -m["debito"]
+            puc   = m.get("cuenta_puc") or "—"
             signo = "✅" if m["credito"] > 0 else "🔴"
             lineas.append(f"{signo} {m['fecha']} | {m['concepto'][:30]} | {fmt_cop(abs(val))} | PUC {puc}")
         explicacion = (
@@ -918,27 +1141,10 @@ async def webhook_whatsapp(
         enviar_whatsapp(numero, msg)
         return {"status": "ok"}
 
-    # ── Comando: saldo ───────────────────────────────────────────────────────
-    if any(k in mensaje for k in ["saldo"]):
-        log.info(f"WA {numero}: rama=saldo")
-        if not sesion:
-            enviar_whatsapp(numero, _MSG_SIN_PDF)
-            return {"status": "ok"}
-        r = sesion.resumen
-        msg = (
-            f"💰 *Saldo del extracto*\n\n"
-            f"💚 Ingresos: {fmt_cop(r['ingresos'])}\n"
-            f"🔴 Egresos:  {fmt_cop(r['egresos'])}\n"
-            f"💰 Saldo neto: {fmt_cop(r['saldo'])}\n\n"
-            f"📋 {r['total_tx']} transacciones en el período"
-        )
-        enviar_whatsapp(numero, msg)
-        return {"status": "ok"}
-
     # ── Comando: pagos pendientes ────────────────────────────────────────────
     if any(k in mensaje for k in ["pagos", "pendientes", "vencimientos", "proveedores"]):
         log.info(f"WA {numero}: rama=pagos_pendientes")
-        if not sesion:
+        if not sesion or not sesion.mov_banco:
             enviar_whatsapp(numero, _MSG_SIN_PDF)
             return {"status": "ok"}
         background_tasks.add_task(reporte_pagos_pendientes, numero)
@@ -950,25 +1156,32 @@ async def webhook_whatsapp(
         background_tasks.add_task(reporte_fiscal, numero)
         return {"status": "ok"}
 
-    # ── Saludo / ayuda ───────────────────────────────────────────────────────
-    if any(k in mensaje for k in ["ayuda", "help", "hola", "buenas", "buenos", "menu"]):
-        log.info(f"WA {numero}: rama=ayuda")
-        tiene_extracto = "✅ Extracto cargado" if sesion else "📄 Sin extracto — envía el PDF para comenzar"
-        enviar_whatsapp(numero,
-            f"¡Hola! Soy *CONTA*, tu Auxiliar Contable de Metrika Group.\n\n"
-            f"Estado: {tiene_extracto}\n\n"
-            f"Comandos disponibles:\n"
-            f"- Envía el *PDF* del extracto bancario\n"
-            f"- *clasificar* → top 10 con cuenta PUC\n"
-            f"- *saldo* → resumen del período\n"
-            f"- *pagos pendientes* → principales egresos\n"
-            f"- *impuestos* → calendario DIAN\n"
-            f"- Cualquier otra pregunta contable")
+    # ── Comando: facturas ────────────────────────────────────────────────────
+    if "facturas" in mensaje:
+        log.info(f"WA {numero}: rama=facturas")
+        if not sesion or not sesion.facturas:
+            enviar_whatsapp(numero, "ℹ️ No tienes facturas registradas en esta sesión.")
+            return {"status": "ok"}
+        total_cp = sum(f.get("total", 0) for f in sesion.facturas)
+        lineas = []
+        for i, f in enumerate(sesion.facturas, 1):
+            lineas.append(
+                f"{i}. {f.get('emisor', 'Desconocido')[:25]}\n"
+                f"   NIT: {f.get('nit', '—')} | Fecha: {f.get('fecha', '—')}\n"
+                f"   Total: {fmt_cop(f.get('total', 0))}"
+            )
+        msg = (
+            "🧾 *Facturas Registradas*\n\n"
+            + "\n\n".join(lineas)
+            + f"\n\n💰 *Total cuentas por pagar: {fmt_cop(total_cp)}*"
+        )
+        enviar_whatsapp(numero, msg)
         return {"status": "ok"}
 
-    # ── Consulta libre → Gemini con contexto de sesión ───────────────────────
-    log.info(f"WA {numero}: rama=consulta_libre — '{Body[:60]}'")
-    background_tasks.add_task(responder_consulta_libre, numero, Body, sesion)
+    # ── Consulta libre → responder sin IA ───────────────────────────────────
+    log.info(f"WA {numero}: rama=responder_sin_ia — '{Body[:60]}'")
+    respuesta = responder_sin_ia(Body, sesion)
+    enviar_whatsapp(numero, respuesta)
     return {"status": "ok"}
 
 # ─── Tareas en background ─────────────────────────────────────────────────────
@@ -997,22 +1210,36 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
         pdf_bytes = resp.content
         log.info(f"PDF descargado: {len(pdf_bytes):,} bytes")
 
+        # Detectar si es factura o extracto bancario
+        texto_pdf = _extraer_texto_pdf(pdf_bytes)
+        if _es_factura(texto_pdf):
+            log.info(f"PDF detectado como factura para {numero}")
+            await _procesar_factura(numero, texto_pdf)
+            return
+
         mov_banco = await parsear_extracto_bancolombia(pdf_bytes)
         if not mov_banco:
-            enviar_whatsapp(numero, "❌ No pude leer los movimientos del PDF. Asegúrate de que sea un extracto bancario en formato texto.")
+            enviar_whatsapp(numero,
+                "❌ No pude leer los movimientos del PDF. "
+                "Asegúrate de que sea un extracto bancario en formato texto.")
             return
 
         clasificados = clasificar_con_reglas_locales(mov_banco)
         resumen = computar_resumen_wa(clasificados)
 
+        # Preservar facturas de la sesión anterior si existe
+        sesion_prev = SESIONES.get(numero)
+        facturas_prev = sesion_prev.facturas if sesion_prev else []
+
         SESIONES[numero] = SesionExtracto(
             mov_banco=mov_banco,
             resumen=resumen,
             clasificados=clasificados,
+            facturas=facturas_prev,
         )
         log.info(f"Sesión guardada para {numero} — {len(mov_banco)} movimientos")
 
-        clasificados_n  = sum(1 for m in clasificados if m.get("cuenta_puc"))
+        clasificados_n   = sum(1 for m in clasificados if m.get("cuenta_puc"))
         sin_clasificar_n = len(clasificados) - clasificados_n
 
         enviar_whatsapp(numero,
@@ -1041,6 +1268,42 @@ async def procesar_extracto_pdf(numero: str, media_url: str):
     except Exception as e:
         log.error(f"Error en procesar_extracto_pdf: {e}", exc_info=True)
         enviar_whatsapp(numero, "❌ Ocurrió un error procesando el extracto. Intenta de nuevo.")
+
+
+async def _procesar_factura(numero: str, texto_pdf: str):
+    try:
+        datos = _extraer_datos_factura(texto_pdf)
+        log.info(f"Factura procesada para {numero}: emisor={datos['emisor']}, total={datos['total']}")
+
+        sesion = SESIONES.get(numero)
+        if sesion:
+            sesion.facturas.append(datos)
+        else:
+            SESIONES[numero] = SesionExtracto(
+                mov_banco=[],
+                resumen={
+                    "total_tx": 0, "ingresos": 0.0, "egresos": 0.0,
+                    "saldo": 0.0, "top10": [], "por_cuenta": {},
+                },
+                clasificados=[],
+                facturas=[datos],
+            )
+
+        msg = (
+            f"🧾 *Factura detectada y registrada:*\n\n"
+            f"🏢 Emisor: {datos['emisor']}\n"
+            f"🔢 NIT: {datos['nit']}\n"
+            f"📅 Fecha: {datos['fecha']}\n"
+            f"💵 Valor: {fmt_cop(datos['subtotal'])}\n"
+            f"🧮 IVA: {fmt_cop(datos['iva'])}\n"
+            f"💰 Total: {fmt_cop(datos['total'])}\n\n"
+            f"Agregada a cuentas por pagar ✅\n"
+            f"Escribe *facturas* para ver todas"
+        )
+        enviar_whatsapp(numero, msg)
+    except Exception as e:
+        log.error(f"Error procesando factura para {numero}: {e}", exc_info=True)
+        enviar_whatsapp(numero, "❌ Error al procesar la factura. Intenta de nuevo.")
 
 
 def reporte_pagos_pendientes(numero: str):
@@ -1084,39 +1347,3 @@ def reporte_fiscal(numero: str):
         msg += f"{icono} *{ob['obligacion']}*\nPeríodo: {ob['periodo']}\nVence: {ob['vencimiento']} ({dias} días)\n\n"
     msg += "_Verifica las fechas exactas según tu NIT en el calendario DIAN._"
     enviar_whatsapp(numero, msg)
-
-
-def responder_consulta_libre(numero: str, mensaje: str, sesion: "SesionExtracto | None" = None):
-    try:
-        contexto = ""
-        if sesion:
-            r = sesion.resumen
-            top5 = sesion.resumen["top10"][:5]
-            lineas_top = "\n".join(
-                f"  {m['fecha']} | {m['concepto'][:35]} | "
-                f"{fmt_cop(m['credito'] if m['credito'] > 0 else m['debito'])} | "
-                f"{'Abono' if m['credito'] > 0 else 'Cargo'} | PUC {m.get('cuenta_puc') or '—'}"
-                for m in top5
-            )
-            dist_lineas = "\n".join(
-                f"  PUC {cod} {v['nombre']}: {v['n']} mov · {fmt_cop(v['total'])}"
-                for cod, v in list(r["por_cuenta"].items())[:6]
-            )
-            contexto = (
-                f"EXTRACTO BANCARIO CARGADO ({r['total_tx']} transacciones):\n"
-                f"- Ingresos: {fmt_cop(r['ingresos'])}\n"
-                f"- Egresos:  {fmt_cop(r['egresos'])}\n"
-                f"- Saldo neto: {fmt_cop(r['saldo'])}\n\n"
-                f"TOP 5 POR VALOR:\n{lineas_top}\n\n"
-                f"DISTRIBUCIÓN PUC:\n{dist_lineas}"
-            )
-        log.info(f"[consulta_libre] Enviando a Gemini: '{mensaje[:60]}' — con_sesion={sesion is not None}")
-        respuesta = consultar_agente(mensaje, contexto)
-        log.info(f"[consulta_libre] Gemini respondió ({len(respuesta)} chars)")
-        enviar_whatsapp(numero, respuesta)
-    except Exception as e:
-        log.error(f"[consulta_libre] Error inesperado: {type(e).__name__}: {e}", exc_info=True)
-        try:
-            enviar_whatsapp(numero, f"❌ Error al procesar tu consulta: {type(e).__name__}: {e}")
-        except Exception as e2:
-            log.error(f"[consulta_libre] No se pudo enviar error al usuario: {e2}")
